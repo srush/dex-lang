@@ -18,7 +18,6 @@ module Cat (CatT, MonadCat, runCatT, look, extend, scoped, looks, extendLocal,
 -- Monad for tracking monoidal state
 
 import Control.Applicative
-import Control.Monad.Fail
 import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Control.Monad.Writer
@@ -42,7 +41,7 @@ instance (Monoid env, Monad m) => MonadCat env (CatT env m) where
     put (fullState <> x, localState <> x)
   scoped (CatT m) = CatT $ do
     originalState <- get
-    put $ (fst originalState, mempty)
+    put (fst originalState, mempty)
     ans <- m
     newLocalState <- gets snd
     put originalState
@@ -51,7 +50,7 @@ instance (Monoid env, Monad m) => MonadCat env (CatT env m) where
 instance MonadCat env m => MonadCat env (StateT s m) where
   look = lift look
   extend x = lift $ extend x
-  scoped m = StateT $ \s -> do
+  scoped m = StateT \s -> do
     ((ans, s'), env) <- scoped $ runStateT m s
     return $ ((ans, env), s')
 
@@ -146,7 +145,7 @@ catTraverse f inj xs env = runCatT (traverse (asCat f inj) xs) env
 
 catFoldM :: (Monoid env, Traversable t, Monad m)
         => (env -> a -> m env) -> env -> t a -> m env
-catFoldM f env xs = liftM snd $ flip runCatT env $ forM_ xs $ \x -> do
+catFoldM f env xs = liftM snd $ flip runCatT env $ forM_ xs \x -> do
   cur <- look
   new <- lift $ f cur x
   extend new
@@ -157,7 +156,7 @@ catFold f env xs = runIdentity $ catFoldM (\e x -> Identity $ f e x) env xs
 
 catMapM :: (Monoid env, Traversable t, Monad m)
         => (env -> a -> m (b, env)) -> env -> t a -> m (t b, env)
-catMapM f env xs = flip runCatT env $ forM xs $ \x -> do
+catMapM f env xs = flip runCatT env $ forM xs \x -> do
   cur <- look
   (y, new) <- lift $ f cur x
   extend new

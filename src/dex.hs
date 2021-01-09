@@ -11,10 +11,12 @@ import System.Exit
 import Control.Monad
 import Control.Monad.State.Strict
 import Options.Applicative
+import Text.PrettyPrint.ANSI.Leijen (text, hardline)
 import System.Posix.Terminal (queryTerminal)
 import System.Posix.IO (stdOutput)
-import System.Exit
+
 import System.Directory
+import Data.List
 
 import Syntax
 import PPrint
@@ -25,6 +27,8 @@ import Resources
 import TopLevel
 import Parser  hiding (Parser)
 import LiveOutput
+import Env (envNames)
+import Export
 
 data ErrorHandling = HaltOnErr | ContinueOnErr
 data DocFmt = ResultOnly | TextDoc | HTMLDoc | JSONDoc
@@ -44,8 +48,10 @@ runMode evalMode preludeFile opts = do
   env <- cached "prelude" key $ evalPrelude opts preludeFile
   let runEnv m = evalStateT m env
   case evalMode of
-    ReplMode prompt ->
-      runEnv $ runInputT defaultSettings $ forever (replLoop prompt opts)
+    ReplMode prompt -> do
+      let filenameAndDexCompletions = completeQuotedWord (Just '\\') "\"'" listFiles dexCompletions
+      let hasklineSettings = setComplete filenameAndDexCompletions defaultSettings
+      runEnv $ runInputT hasklineSettings $ forever (replLoop prompt opts)
     ScriptMode fname fmt _ -> do
       results <- runEnv $ evalFile opts fname
       printLitProg fmt results
@@ -54,17 +60,19 @@ runMode evalMode preludeFile opts = do
     WebMode    fname -> runWeb      fname opts env
     WatchMode  fname -> runTerminal fname opts env
     ExportMode dexPath objPath -> do
-      results <- fmap snd <$> (runEnv $ evalFile opts dexPath)
+      results <- fmap snd <$> runEnv (evalFile opts dexPath)
       let outputs = foldMap (\(Result outs _) -> outs) results
       let errors = foldMap (\case (Result _ (Left err)) -> [err]; _ -> []) results
       putStr $ foldMap (nonEmptyNewline . pprint) errors
       let exportedFuns = foldMap (\case (ExportedFun name f) -> [(name, f)]; _ -> []) outputs
-      exportFunctions objPath exportedFuns env opts
+      unless (backendName opts == LLVM) $ liftEitherIO $
+        throw CompilerErr "Export only supported with the LLVM CPU backend"
+      exportFunctions objPath exportedFuns env
 
 evalPrelude :: EvalConfig -> Maybe FilePath -> IO TopEnv
-evalPrelude opts fname = flip execStateT mempty $ do
+evalPrelude opts fname = flip execStateT initTopEnv $ do
   source <- case fname of
-              Nothing   -> return $ preludeSource
+              Nothing   -> return preludeSource
               Just path -> liftIO $ readFile path
   result <- evalSource opts source
   void $ liftErrIO $ mapM (\(_, Result _ r) -> r) result
@@ -77,6 +85,20 @@ replLoop prompt opts = do
   case result of Result _ (Left _) -> lift $ put env
                  _ -> return ()
   liftIO $ putStrLn $ pprint result
+
+dexCompletions :: CompletionFunc (StateT TopEnv IO)
+dexCompletions (line, _) = do
+  env <- get
+  let varNames = map pprint $ envNames env
+  -- note: line and thus word and rest have character order reversed
+  let (word, rest) = break (== ' ') line
+  let anywhereKeywords = ["def", "for", "rof", "case", "data", "where", "of", "if",
+                          "then", "else", "interface", "instance", "do", "view"]
+  let startoflineKeywords = ["%bench \"", ":p", ":t", ":html", ":export"]
+  let candidates = (if null rest then startoflineKeywords else []) ++
+                   anywhereKeywords ++ varNames
+  let completions = map simpleCompletion $ filter (reverse word `isPrefixOf`) candidates
+  return (rest, completions)
 
 liftErrIO :: MonadIO m => Except a -> m a
 liftErrIO (Left err) = liftIO $ putStrLn (pprint err) >> exitFailure
@@ -106,56 +128,62 @@ printLitProg TextDoc prog = do
   isatty <- queryTerminal stdOutput
   putStr $ foldMap (uncurry (printLitBlock isatty)) prog
 printLitProg JSONDoc prog =
-  forM_ prog $ \(_, result) -> case toJSONStr result of
+  forM_ prog \(_, result) -> case toJSONStr result of
     "{}" -> return ()
     s -> putStrLn s
 
+nonEmptyNewline :: String -> String
 nonEmptyNewline [] = []
 nonEmptyNewline l  = l ++ ['\n']
 
 parseOpts :: ParserInfo CmdOpts
 parseOpts = simpleInfo $ CmdOpts
   <$> parseMode
-  <*> (optional $ strOption $ long "prelude" <> metavar "FILE" <> help "Prelude file")
+  <*> optional (strOption $ long "prelude" <> metavar "FILE" <> help "Prelude file")
   <*> parseEvalOpts
+
+helpOption :: String -> String -> Mod f a
+helpOption optionName options =
+  helpDoc (Just (text optionName <> hardline <> text options))
 
 parseMode :: Parser EvalMode
 parseMode = subparser $
-     (command "repl" $ simpleInfo $
-         ReplMode <$> (strOption $ long "prompt" <> value ">=> "
-                         <> metavar "STRING" <> help "REPL prompt"))
-  <> (command "web"    $ simpleInfo (WebMode    <$> sourceFileInfo ))
-  <> (command "watch"  $ simpleInfo (WatchMode  <$> sourceFileInfo ))
-  <> (command "export" $ simpleInfo (ExportMode <$> sourceFileInfo <*> objectFileInfo))
-  <> (command "script" $ simpleInfo (ScriptMode <$> sourceFileInfo
-    <*> (option
-            (optionList [ ("literate"   , TextDoc)
-                        , ("result-only", ResultOnly)
-                        , ("HTML"       , HTMLDoc)
-                        , ("JSON"       , JSONDoc)])
-            (long "outfmt" <> value TextDoc
-             <> help "Output format (literate(default)|result-only|HTML|JSON"))
-    <*> flag HaltOnErr ContinueOnErr (
-                  long "allow-errors"
-               <> help "Evaluate programs containing non-fatal type errors")))
+     command "repl" (simpleInfo
+         (ReplMode <$> strOption (long "prompt" <> value ">=> "
+                         <> metavar "STRING" <> help "REPL prompt")))
+  <> command "web"    (simpleInfo (WebMode    <$> sourceFileInfo))
+  <> command "watch"  (simpleInfo (WatchMode  <$> sourceFileInfo))
+  <> command "export" (simpleInfo (ExportMode <$> sourceFileInfo <*> objectFileInfo))
+  <> command "script" (simpleInfo (ScriptMode <$> sourceFileInfo
+  <*> option
+        (optionList [ ("literate"   , TextDoc)
+                    , ("result-only", ResultOnly)
+                    , ("html"       , HTMLDoc)
+                    , ("json"       , JSONDoc)])
+        (long "outfmt" <> value TextDoc <>
+         helpOption "Output format" "literate (default) | result-only | html | json")
+  <*> flag HaltOnErr ContinueOnErr (
+                long "allow-errors"
+             <> help "Evaluate programs containing non-fatal type errors")))
   where
     sourceFileInfo = argument str (metavar "FILE" <> help "Source program")
     objectFileInfo = argument str (metavar "OBJFILE" <> help "Output path (.o file)")
 
 optionList :: [(String, a)] -> ReadM a
-optionList opts = eitherReader $ \s -> case lookup s opts of
+optionList opts = eitherReader \s -> case lookup s opts of
   Just x  -> Right x
   Nothing -> Left $ "Bad option. Expected one of: " ++ show (map fst opts)
 
 parseEvalOpts :: Parser EvalConfig
 parseEvalOpts = EvalConfig
-  <$> (option
-         (optionList [ ("LLVM", LLVM)
-                     , ("LLVM-CUDA", LLVMCUDA)
-                     , ("LLVM-MC", LLVMMC)
-                     , ("interp", Interp)])
-         (long "backend" <> value LLVM <> help "Backend (LLVM(default)|LLVM-CUDA|interp)"))
-  <*> (optional $ strOption $ long "logto"
+  <$> option
+         (optionList [ ("llvm", LLVM)
+                     , ("llvm-cuda", LLVMCUDA)
+                     , ("llvm-mc", LLVMMC)
+                     , ("interpreter", Interpreter)])
+         (long "backend" <> value LLVM <>
+          helpOption "Backend" "llvm (default) | llvm-cuda | llvm-mc | interpreter")
+  <*> optional (strOption $ long "logto"
                     <> metavar "FILE"
                     <> help "File to log to" <> showDefault)
 

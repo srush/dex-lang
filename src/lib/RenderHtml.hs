@@ -19,10 +19,11 @@ import Control.Monad
 import Text.Megaparsec hiding (chunk)
 import Text.Megaparsec.Char as C
 
+import Resources (cssSource)
 import Syntax
 import PPrint
 import Parser
-import Serialize()
+import Serialize ()
 
 pprintHtml :: ToMarkup a => a -> String
 pprintHtml x = renderHtml $ toMarkup x
@@ -34,7 +35,7 @@ progHtml blocks = renderHtml $ wrapBody $ map toHtmlBlock blocks
 wrapBody :: [Html] -> Html
 wrapBody blocks = docTypeHtml $ do
   H.head $ do
-    H.link ! rel "stylesheet" ! href "style.css" ! type_ "text/css"
+    H.style ! type_ "text/css" $ toHtml cssSource
     H.meta ! charset "UTF-8"
   H.body $ H.div inner ! At.id "main-output"
   where inner = foldMap (cdiv "cell") blocks

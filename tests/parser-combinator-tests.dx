@@ -1,0 +1,54 @@
+
+include "parser.dx"
+
+parseABC : Parser Unit = MkParser \h.
+  parse h $ pChar 'A'
+  parse h $ pChar 'B'
+  parse h $ pChar 'C'
+
+:p runParser "AAA" parseABC
+> Nothing
+
+:p runParser "ABCABC" parseABC
+> Nothing
+
+:p runParser "AB" parseABC
+> Nothing
+
+:p runParser "ABC" parseABC
+> (Just ())
+
+def parseT : Parser Bool = MkParser \h.
+  parse h $ pChar 'T'
+  True
+
+def parseF : Parser Bool = MkParser \h.
+  parse h $ pChar 'F'
+  False
+
+def parseTF : Parser Bool =
+  parseT <|> parseF
+
+def parserTFTriple : Parser (Fin 3=>Bool) = MkParser \h.
+  for i. parse h parseTF
+
+:p runParser "TTF" parserTFTriple
+> (Just [True, True, False])
+
+:p runParser "TTFX" parserTFTriple
+> Nothing
+
+:p runParser "TTFFTT" $ parseMany parseTF
+> (Just (AsList 6 [True, True, False, False, True, True]))
+
+:p runParser "1021389" $ parseMany parseDigit
+> (Just (AsList 7 [1, 0, 2, 1, 3, 8, 9]))
+
+:p runParser "1389" $ parseInt
+> (Just 1389)
+
+:p runParser "01389" $ parseInt
+> (Just 1389)
+
+:p runParser "-1389" $ parseInt
+> (Just -1389)

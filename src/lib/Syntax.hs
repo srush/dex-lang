@@ -10,17 +10,15 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE StrictData #-}
 {-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE Rank2Types #-}
 
 module Syntax (
     Type, Kind, BaseType (..), ScalarBaseType (..),
-    Effect, EffectName (..), EffectRow (..),
+    Effect (..), RWS (..), EffectRow (..),
     ClassName (..), TyQual (..), SrcPos, Var, Binder, Block (..), Decl (..),
     Expr (..), Atom (..), ArrowP (..), Arrow, PrimTC (..), Abs (..),
-    PrimExpr (..), PrimCon (..), LitVal (..),
-    PrimEffect (..), PrimOp (..), EffectSummary, pattern NoEffects,
+    PrimExpr (..), PrimCon (..), LitVal (..), PrimEffect (..), PrimOp (..),
     PrimHof (..), LamExpr, PiType, WithSrc (..), srcPos, LetAnn (..),
     BinOp (..), UnOp (..), CmpOp (..), SourceBlock (..),
     ReachedEOF, SourceBlock' (..), SubstEnv, ScopedSubstEnv,
@@ -31,29 +29,32 @@ module Syntax (
     IPrimOp, IVar, IBinder, IType, SetVal (..), MonMap (..), LitProg,
     IFunType (..), IFunVar, CallingConvention (..), IsCUDARequired (..),
     UAlt (..), AltP, Alt, Label, LabeledItems (..), labeledSingleton,
-    reflectLabels, withLabels, ExtLabeledItems (..), prefixExtLabeledItems,
+    lookupLabelHead, reflectLabels, withLabels, ExtLabeledItems (..),
+    prefixExtLabeledItems, getLabels,
     IScope, BinderInfo (..), Bindings, CUDAKernel (..), BenchStats,
-    SrcCtx, Result (..), Output (..), OutFormat (..), DataFormat (..),
+    SrcCtx, Result (..), Output (..), OutFormat (..),
     Err (..), ErrType (..), Except, throw, throwIf, modifyErr, addContext,
     addSrcContext, catchIOExcept, liftEitherIO, (-->), (--@), (==>),
     boundUVars, PassName (..), boundVars, renamingSubst, bindingsAsVars,
     freeVars, freeUVars, Subst, HasVars, BindsVars, Ptr, PtrType,
-    AddressSpace (..), PtrOrigin (..), showPrimName, strToPrimName, primNameToStr,
+    AddressSpace (..), showPrimName, strToPrimName, primNameToStr,
     monMapSingle, monMapLookup, Direction (..), Limit (..),
-    UExpr, UExpr' (..), UType, UPatAnn, UPiPatAnn, UAnnBinder, UVar,
+    UExpr, UExpr' (..), UType, UPatAnn, UAnnBinder, UVar,
+    UMethodDef (..), UPatAnnArrow,
     UPat, UPat' (..), UModule (..), UDecl (..), UArrow, arrowEff,
     DataDef (..), DataConDef (..), UConDef (..), Nest (..), toNest,
     subst, deShadow, scopelessSubst, absArgType, applyAbs, makeAbs,
     applyNaryAbs, applyDataDefParams, freshSkolemVar, IndexStructure,
     mkConsList, mkConsListTy, fromConsList, fromConsListTy, extendEffRow,
-    getProjection,
+    getProjection, outputStreamPtrName, initTopEnv,
     varType, binderType, isTabTy, LogLevel (..), IRVariant (..),
     applyIntBinOp, applyIntCmpOp, applyFloatBinOp, applyFloatUnOp,
     getIntLit, getFloatLit, sizeOf, vectorWidth,
+    pattern MaybeTy, pattern JustAtom, pattern NothingAtom,
     pattern IdxRepTy, pattern IdxRepVal, pattern IIdxRepVal, pattern IIdxRepTy,
     pattern TagRepTy, pattern TagRepVal, pattern Word8Ty,
     pattern IntLitExpr, pattern FloatLitExpr,
-    pattern UnitTy, pattern PairTy, pattern FunTy,
+    pattern UnitTy, pattern PairTy, pattern FunTy, pattern PiTy,
     pattern FixedIntRange, pattern Fin, pattern RefTy, pattern RawRefTy,
     pattern BaseTy, pattern PtrTy, pattern UnitVal,
     pattern PairVal, pattern PureArrow,
@@ -61,24 +62,25 @@ module Syntax (
     pattern TabTy, pattern TabTyAbs, pattern TabVal, pattern TabValA,
     pattern Pure, pattern BinaryFunTy, pattern BinaryFunVal,
     pattern Unlabeled, pattern NoExt, pattern LabeledRowKind,
-    pattern NoLabeledItems, pattern InternalSingletonLabel, pattern EffKind)
+    pattern NoLabeledItems, pattern InternalSingletonLabel, pattern EffKind,
+    pattern NestOne, pattern NewTypeCon, pattern BinderAnn,
+    pattern ClassDictDef, pattern ClassDictCon, pattern UnderscoreUPat)
   where
 
 import qualified Data.Map.Strict as M
 import Control.Exception hiding (throw)
-import Control.Monad.Fail
 import Control.Monad.Identity
 import Control.Monad.Writer hiding (Alt)
 import Control.Monad.Except hiding (Except)
 import qualified Data.ByteString.Char8 as B
-import Data.List (sort)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Set as S
 import Data.Store (Store)
 import Data.Tuple (swap)
-import Data.Foldable (toList)
+import Data.Foldable (toList, fold)
 import Data.Int
 import Data.Word
+import Data.String (IsString, fromString)
 import Foreign.Ptr
 import GHC.Generics
 
@@ -186,11 +188,19 @@ labeledSingleton label value = LabeledItems $ M.singleton label (value NE.:|[])
 
 reflectLabels :: LabeledItems a -> LabeledItems (Label, Int)
 reflectLabels (LabeledItems items) = LabeledItems $
-  flip M.mapWithKey items $ \k xs -> fmap (\(i,_) -> (k,i)) (enumerate xs)
+  flip M.mapWithKey items \k xs -> fmap (\(i,_) -> (k,i)) (enumerate xs)
+
+getLabels :: LabeledItems a -> [Label]
+getLabels labeledItems = map fst $ toList $ reflectLabels labeledItems
 
 withLabels :: LabeledItems a -> LabeledItems (Label, Int, a)
 withLabels (LabeledItems items) = LabeledItems $
-  flip M.mapWithKey items $ \k xs -> fmap (\(i,a) -> (k,i,a)) (enumerate xs)
+  flip M.mapWithKey items \k xs -> fmap (\(i,a) -> (k,i,a)) (enumerate xs)
+
+lookupLabelHead :: LabeledItems a -> Label -> Maybe a
+lookupLabelHead (LabeledItems items) l = case M.lookup l items of
+  Nothing -> Nothing
+  Just (x NE.:| _) -> Just x
 
 instance Semigroup (LabeledItems a) where
   LabeledItems items <> LabeledItems items' =
@@ -216,7 +226,7 @@ prefixExtLabeledItems items (Ext items' rest) = Ext (items <> items') rest
 type UExpr = WithSrc UExpr'
 data UExpr' = UVar UVar
             | ULam UPatAnn UArrow UExpr
-            | UPi  UPiPatAnn Arrow UType
+            | UPi  UPatAnn  Arrow UType
             | UApp UArrow UExpr UExpr
             | UDecl UDecl UExpr
             | UFor Direction UPatAnn UExpr
@@ -236,17 +246,21 @@ data UExpr' = UVar UVar
               deriving (Show, Generic)
 
 data UConDef = UConDef Name (Nest UAnnBinder)  deriving (Show, Generic)
-data UDecl = ULet LetAnn UPatAnn UExpr
-           | UData UConDef [UConDef]
-             deriving (Show, Generic)
+data UDecl =
+   ULet LetAnn UPatAnn UExpr
+ | UData UConDef [UConDef]
+ | UInterface [UType] UConDef [UAnnBinder] -- superclasses, constructor, methods
+ | UInstance (Nest UPatAnnArrow) UType [UMethodDef]  -- args, type, methods
+   deriving (Show, Generic)
 
 type UType  = UExpr
 type UArrow = ArrowP ()
 type UVar    = VarP ()
 type UBinder = BinderP ()
+data UMethodDef = UMethodDef UVar UExpr deriving (Show, Generic)
 
-type UPatAnn   = (UPat, Maybe UType)
-type UPiPatAnn   = (Maybe UPat, UType)
+type UPatAnn      = (UPat, Maybe UType)
+type UPatAnnArrow = (UPatAnn, UArrow)
 type UAnnBinder = BinderP UType
 
 data UAlt = UAlt UPat UExpr deriving (Show, Generic)
@@ -270,6 +284,12 @@ data WithSrc a = WithSrc SrcCtx a
 
 srcPos :: WithSrc a -> SrcCtx
 srcPos (WithSrc pos _) = pos
+
+instance IsString UExpr' where
+  fromString s = UVar $ Name SourceName (fromString s) 0 :> ()
+
+pattern UnderscoreUPat :: UPat
+pattern UnderscoreUPat = WithSrc Nothing (UPatBinder (Ignore ()))
 
 -- === primitive constructors and operators ===
 
@@ -322,12 +342,14 @@ data PrimOp e =
       | SndRef e
       | FFICall String e [e]
       | Inject e
-      | PtrOffset e e
-      | PtrLoad e
-      | GetPtr e
-      | MakePtrType e
       | SliceOffset e e              -- Index slice first, inner index second
       | SliceCurry  e e              -- Index slice first, curried index second
+      -- Low-level memory operations
+      | IOAlloc BaseType e
+      | IOFree e
+      | PtrOffset e e
+      | PtrLoad e
+      | PtrStore e e
       -- SIMD operations
       | VectorBinOp BinOp e e
       | VectorPack [e]               -- List should have exactly vectorWidth elements
@@ -337,6 +359,7 @@ data PrimOp e =
       | ToOrdinal e
       | IdxSetSize e
       | ThrowError e
+      | ThrowException e             -- Catchable exceptions (unlike `ThrowError`)
       | CastOp e e                   -- Type, then value. See Type.hs for valid coercions.
       -- Extensible record and variant operations:
       -- Add fields to a record (on the left). Left arg contains values to add.
@@ -360,10 +383,12 @@ data PrimOp e =
 data PrimHof e =
         For ForAnn e
       | Tile Int e e          -- dimension number, tiled body, scalar body
-      | While e e
+      | While e
       | RunReader e e
       | RunWriter e
       | RunState  e e
+      | RunIO e
+      | CatchException e
       | Linearize e
       | Transpose e
       | PTileReduce e e       -- index set, thread body
@@ -418,33 +443,39 @@ showPrimName prim = primNameToStr $ fmap (const ()) prim
 
 -- === effects ===
 
-type Effect = (EffectName, Name)
-data EffectRow = EffectRow [Effect] (Maybe Name)
-                 deriving (Show, Generic)
-data EffectName = Reader | Writer | State  deriving (Show, Eq, Ord, Generic)
+data EffectRow = EffectRow (S.Set Effect) (Maybe Name)
+                 deriving (Show, Eq, Generic)
 
-type EffectSummary = S.Set Effect
-
-instance HasVars EffectSummary where
-  freeVars effs = foldMap (\(_, reg) -> reg @> (TyKind, UnknownBinder)) effs
-
-instance Subst EffectSummary where
-  subst (env, _) effs = S.map substEff effs
-    where
-      substEff (eff, name) = case envLookup env name of
-        Just ~(Var (name':>_)) -> (eff, name')
-        Nothing               -> (eff, name)
+data RWS = Reader | Writer | State               deriving (Show, Eq, Ord, Generic)
+data Effect = RWSEffect RWS Name | ExceptionEffect | IOEffect
+              deriving (Show, Eq, Ord, Generic)
 
 pattern Pure :: EffectRow
-pattern Pure = EffectRow [] Nothing
+pattern Pure <- ((\(EffectRow effs t) -> (S.null effs, t)) -> (True, Nothing))
+ where  Pure = mempty
 
-pattern NoEffects :: EffectSummary
-pattern NoEffects <- ((S.null) -> True)
-  where NoEffects = mempty
+outputStreamPtrName :: Name
+outputStreamPtrName = GlobalName "OUT_STREAM_PTR"
 
-instance Eq EffectRow where
-  EffectRow effs t == EffectRow effs' t' =
-    sort effs == sort effs' && t == t'
+initTopEnv :: TopEnv
+initTopEnv = fold [v @> (ty, LamBound ImplicitArrow) | (v, ty) <-
+  [(outputStreamPtrName , BaseTy $ hostPtrTy $ hostPtrTy $ Scalar Word8Type)]]
+
+hostPtrTy :: BaseType -> BaseType
+hostPtrTy ty = PtrType (Heap CPU, ty)
+
+instance Semigroup EffectRow where
+  EffectRow effs t <> EffectRow effs' t' =
+    EffectRow (S.union effs effs') newTail
+    where
+      newTail = case (t, t') of
+        (Nothing, effTail) -> effTail
+        (effTail, Nothing) -> effTail
+        _ | t == t' -> t
+          | otherwise -> error "Can't combine effect rows with mismatched tails"
+
+instance Monoid EffectRow where
+  mempty = EffectRow mempty Nothing
 
 -- === top-level constructs ===
 
@@ -462,14 +493,13 @@ data SourceBlock' = RunModule UModule
                   | Command CmdName (Name, UModule)
                   | GetNameType Name
                   | IncludeSourceFile String
-                  | LoadData UPatAnn DataFormat String
                   | ProseBlock String
                   | CommentLine
                   | EmptyLines
                   | UnParseable ReachedEOF String
                     deriving (Show, Generic)
 
-data CmdName = GetType | EvalExpr OutFormat | ExportFun String | Dump DataFormat String
+data CmdName = GetType | EvalExpr OutFormat | ExportFun String
                deriving  (Show, Generic)
 
 data LogLevel = LogNothing | PrintEvalTime | PrintBench String
@@ -514,7 +544,7 @@ data ImpFunction = ImpFunction IFunVar [IBinder] ImpBlock
 data ImpBlock    = ImpBlock (Nest ImpDecl) [IExpr]    deriving (Show)
 data ImpDecl     = ImpLet [IBinder] ImpInstr deriving (Show)
 data ImpInstr = IFor Direction IBinder Size ImpBlock
-              | IWhile ImpBlock ImpBlock  -- cond block, body block
+              | IWhile ImpBlock
               | ICond IExpr ImpBlock ImpBlock
               | IQueryParallelism IFunVar IExpr -- returns the number of available concurrent threads
               | ISyncWorkgroup
@@ -529,7 +559,7 @@ data ImpInstr = IFor Direction IBinder Size ImpBlock
               | IPrimOp IPrimOp
                 deriving (Show)
 
-data Backend = LLVM | LLVMCUDA | LLVMMC | Interp  deriving (Show, Eq)
+data Backend = LLVM | LLVMCUDA | LLVMMC | Interpreter  deriving (Show, Eq)
 newtype CUDAKernel = CUDAKernel B.ByteString deriving (Show)
 
 -- === base types ===
@@ -553,8 +583,7 @@ data BaseType = Scalar  ScalarBaseType
 
 data Device = CPU | GPU  deriving (Show, Eq, Ord, Generic)
 data AddressSpace = Stack | Heap Device     deriving (Show, Eq, Ord, Generic)
-data PtrOrigin = DerivedPtr | AllocatedPtr  deriving (Show, Eq, Ord, Generic)
-type PtrType = (PtrOrigin, AddressSpace, BaseType)
+type PtrType = (AddressSpace, BaseType)
 
 sizeOf :: BaseType -> Int
 sizeOf t = case t of
@@ -597,7 +626,7 @@ monMapLookup (MonMap m) k = case M.lookup k m of Nothing -> mempty
 -- === passes ===
 
 data PassName = Parse | TypePass | SynthPass | SimpPass | ImpPass | JitPass
-              | Flops | LLVMOpt | AsmPass | JAXPass | JAXSimpPass | LLVMEval
+              | LLVMOpt | AsmPass | JAXPass | JAXSimpPass | LLVMEval
               | ResultPass | JaxprAndHLO | OptimPass
                 deriving (Ord, Eq, Bounded, Enum)
 
@@ -605,7 +634,7 @@ instance Show PassName where
   show p = case p of
     Parse    -> "parse" ; TypePass -> "typed"   ; SynthPass -> "synth"
     SimpPass -> "simp"  ; ImpPass  -> "imp"     ; JitPass   -> "llvm"
-    Flops    -> "flops" ; LLVMOpt  -> "llvmopt" ; AsmPass   -> "asm"
+    LLVMOpt  -> "llvmopt" ; AsmPass   -> "asm"
     JAXPass  -> "jax"   ; JAXSimpPass -> "jsimp"; ResultPass -> "result"
     LLVMEval -> "llvmeval" ; JaxprAndHLO -> "jaxprhlo"; OptimPass -> "optimized"
 
@@ -615,7 +644,7 @@ type LitProg = [(SourceBlock, Result)]
 type SrcCtx = Maybe SrcPos
 data Result = Result [Output] (Except ())  deriving (Show, Eq)
 
-type BenchStats = Int -- number of runs
+type BenchStats = (Int, Double) -- number of runs, total benchmarking time
 data Output = TextOut String
             | HtmlOut String
             | PassInfo PassName String
@@ -627,7 +656,6 @@ data Output = TextOut String
               deriving (Show, Eq, Generic)
 
 data OutFormat = Printed | RenderHtml  deriving (Show, Eq, Generic)
-data DataFormat = DexObject | DexBinaryObject  deriving (Show, Eq, Generic)
 
 data Err = Err ErrType SrcCtx String  deriving (Show, Eq)
 instance Exception Err
@@ -657,10 +685,10 @@ throwIf True  e s = throw e s
 throwIf False _ _ = return ()
 
 modifyErr :: MonadError e m => m a -> (e -> e) -> m a
-modifyErr m f = catchError m $ \e -> throwError (f e)
+modifyErr m f = catchError m \e -> throwError (f e)
 
 addContext :: MonadError Err m => String -> m a -> m a
-addContext s m = modifyErr m $ \(Err e p s') -> Err e p (s' ++ "\n" ++ s)
+addContext s m = modifyErr m \(Err e p s') -> Err e p (s' ++ "\n" ++ s)
 
 addSrcContext :: MonadError Err m => SrcCtx -> m a -> m a
 addSrcContext ctx m = modifyErr m updateErr
@@ -671,9 +699,9 @@ addSrcContext ctx m = modifyErr m updateErr
 
 catchIOExcept :: (MonadIO m , MonadError Err m) => IO a -> m a
 catchIOExcept m = (liftIO >=> liftEither) $ (liftM Right m) `catches`
-  [ Handler $ \(e::Err)           -> return $ Left e
-  , Handler $ \(e::IOError)       -> return $ Left $ Err DataIOErr   Nothing $ show e
-  , Handler $ \(e::SomeException) -> return $ Left $ Err CompilerErr Nothing $ show e
+  [ Handler \(e::Err)           -> return $ Left e
+  , Handler \(e::IOError)       -> return $ Left $ Err DataIOErr   Nothing $ show e
+  , Handler \(e::SomeException) -> return $ Left $ Err CompilerErr Nothing $ show e
   ]
 
 liftEitherIO :: (Exception e, MonadIO m) => Either e a -> m a
@@ -771,11 +799,23 @@ instance BindsUVars UPat' where
 instance HasUVars UDecl where
   freeUVars (ULet _ p expr) = freeUVars p <> freeUVars expr
   freeUVars (UData (UConDef _ bs) dataCons) = freeUVars $ Abs bs dataCons
+  freeUVars (UInterface superclasses tc methods) =
+    freeUVars $ Abs tc (superclasses, methods)
+  freeUVars (UInstance bsArrows ty methods) = freeUVars $ Abs bs (ty, methods)
+    where bs = fmap fst bsArrows
+
+instance HasUVars UMethodDef where
+  freeUVars (UMethodDef _ def) = freeUVars def
+
+instance BindsUVars UPatAnn where
+  boundUVars (p, _) = boundUVars p
 
 instance BindsUVars UDecl where
   boundUVars decl = case decl of
-   ULet _ (p,_) _ -> boundUVars p
-   UData tyCon dataCons -> boundUVars tyCon <> foldMap boundUVars dataCons
+    ULet _ (p,_) _ -> boundUVars p
+    UData tyCon dataCons -> boundUVars tyCon <> foldMap boundUVars dataCons
+    UInterface _ _ _ -> mempty
+    UInstance _ _ _  -> mempty
 
 instance HasUVars UModule where
   freeUVars (UModule decls) = freeUVars decls
@@ -799,7 +839,12 @@ instance BindsUVars SourceBlock where
 
 instance HasUVars EffectRow where
   freeUVars (EffectRow effs tailVar) =
-    foldMap (nameAsEnv . snd) effs <> foldMap nameAsEnv tailVar
+    foldMap freeUVars effs <> foldMap nameAsEnv tailVar
+
+instance HasUVars Effect where
+  freeUVars (RWSEffect _ h) = nameAsEnv h
+  freeUVars ExceptionEffect = mempty
+  freeUVars IOEffect        = mempty
 
 instance HasUVars a => HasUVars (LabeledItems a) where
   freeUVars (LabeledItems items) = foldMap freeUVars items
@@ -988,8 +1033,9 @@ applyNaryAbs (Abs (Nest b bs) body) (x:xs) = applyNaryAbs ab xs
 applyNaryAbs _ _ = error "wrong number of arguments"
 
 applyDataDefParams :: DataDef -> [Type] -> [DataConDef]
-applyDataDefParams (DataDef _ paramBs cons) params =
-  applyNaryAbs (Abs paramBs cons) params
+applyDataDefParams (DataDef _ bs cons) params
+  | length params == length (toList bs) = applyNaryAbs (Abs bs cons) params
+  | otherwise = error $ "Wrong number of parameters: " ++ show (length params)
 
 makeAbs :: HasVars a => Binder -> a -> Abs Binder a
 makeAbs b body | b `isin` freeVars body = Abs b body
@@ -1115,13 +1161,24 @@ instance Subst Module where
     where Abs decls' bindings' = subst env $ Abs decls bindings
 
 instance HasVars EffectRow where
-  freeVars (EffectRow row t) =
-       foldMap (\(_,v) -> v@>(TyKind , UnknownBinder)) row
-    <> foldMap (\v     -> v@>(EffKind, UnknownBinder)) t
+  freeVars (EffectRow row t) = foldMap freeVars row
+                            <> foldMap (\v -> v@>(EffKind, UnknownBinder)) t
 instance Subst EffectRow where
-  subst (env, _) (EffectRow row t) = extendEffRow
-    (fmap (\(effName, v) -> (effName, substName env v)) row)
-    (substEffTail env t)
+  subst env (EffectRow row t) = extendEffRow row' t'
+   where
+     row' = S.map (subst env) row
+     t' = substEffTail (fst env) t
+
+instance HasVars Effect where
+  freeVars eff = case eff of
+    RWSEffect _ v -> v@>(TyKind , UnknownBinder)
+    ExceptionEffect -> mempty
+    IOEffect        -> mempty
+instance Subst Effect where
+  subst (env,_) eff = case eff of
+    RWSEffect rws v -> RWSEffect rws (substName env v)
+    ExceptionEffect -> ExceptionEffect
+    IOEffect        -> IOEffect
 
 instance HasVars BinderInfo where
   freeVars binfo = case binfo of
@@ -1155,10 +1212,10 @@ instance Subst (ExtLabeledItems Type Name) where
     prefixExtLabeledItems (subst env items) (substExtLabeledItemsTail env' rest)
 
 substEffTail :: SubstEnv -> Maybe Name -> EffectRow
-substEffTail _ Nothing = EffectRow [] Nothing
+substEffTail _ Nothing = EffectRow mempty Nothing
 substEffTail env (Just v) = case envLookup env (v:>()) of
-  Nothing -> EffectRow [] (Just v)
-  Just (Var (v':>_)) -> EffectRow [] (Just v')
+  Nothing -> EffectRow mempty (Just v)
+  Just (Var (v':>_)) -> EffectRow mempty (Just v')
   Just (Eff r) -> r
   _ -> error "Not a valid effect substitution"
 
@@ -1168,7 +1225,7 @@ substName env v = case envLookup env (v:>()) of
   Just (Var (v':>_)) -> v'
   _ -> error "Should only substitute with a name"
 
-extendEffRow :: [Effect] -> EffectRow -> EffectRow
+extendEffRow :: S.Set Effect -> EffectRow -> EffectRow
 extendEffRow effs (EffectRow effs' t) = EffectRow (effs <> effs') t
 
 substExtLabeledItemsTail :: SubstEnv -> Maybe Name -> ExtLabeledItems Type Name
@@ -1238,7 +1295,7 @@ instance HasIVars ImpBlock where
 instance HasIVars ImpInstr where
   freeIVars i = case i of
     IFor _ b n p      -> freeIVars n <> (freeIVars p `envDiff` (b @> ()))
-    IWhile c p        -> freeIVars c <> freeIVars p
+    IWhile p          -> freeIVars p
     ICond  c t f      -> freeIVars c <> freeIVars t <> freeIVars f
     IQueryParallelism _ s -> freeIVars s
     ISyncWorkgroup      -> mempty
@@ -1429,6 +1486,9 @@ fromConsList xs = case xs of
 pattern FunTy :: Binder -> EffectRow -> Type -> Type
 pattern FunTy b eff bodyTy = Pi (Abs b (PlainArrow eff, bodyTy))
 
+pattern PiTy :: Binder -> Arrow -> Type -> Type
+pattern PiTy b arr bodyTy = Pi (Abs b (arr, bodyTy))
+
 pattern BinaryFunTy :: Binder -> Binder -> EffectRow -> Type -> Type
 pattern BinaryFunTy b1 b2 eff bodyTy = FunTy b1 Pure (FunTy b2 eff bodyTy)
 
@@ -1463,7 +1523,48 @@ pattern Unlabeled as <- (_getUnlabeled -> Just as)
           Just ne -> LabeledItems (M.singleton InternalSingletonLabel ne)
           Nothing -> NoLabeledItems
 
-  -- TODO: Enable once https://gitlab.haskell.org//ghc/ghc/issues/13363 is fixed...
+maybeDataDef :: DataDef
+maybeDataDef = DataDef (GlobalName "Maybe") (Nest (Bind ("a":>TyKind)) Empty)
+  [ DataConDef (GlobalName "Nothing") Empty
+  , DataConDef (GlobalName "Just"   ) (Nest (Ignore (Var ("a":>TyKind))) Empty)]
+
+pattern MaybeTy :: Type -> Type
+pattern MaybeTy a = TypeCon MaybeDataDef [a]
+
+pattern MaybeDataDef :: DataDef
+pattern MaybeDataDef <- ((\def -> def == maybeDataDef) -> True)
+  where MaybeDataDef = maybeDataDef
+
+pattern NothingAtom :: Type -> Atom
+pattern NothingAtom ty = DataCon MaybeDataDef [ty] 0 []
+
+pattern JustAtom :: Type -> Atom -> Atom
+pattern JustAtom ty x = DataCon MaybeDataDef [ty] 1 [x]
+
+pattern NestOne :: a -> Nest a
+pattern NestOne x = Nest x Empty
+
+pattern BinderAnn :: a -> BinderP a
+pattern BinderAnn x <- ((\case Ignore   ann  -> ann
+                               Bind (_:>ann) -> ann) -> x)
+  where BinderAnn x = Ignore x
+
+pattern NewTypeCon :: Name -> Type -> [DataConDef]
+pattern NewTypeCon con ty = [DataConDef con (NestOne (BinderAnn ty))]
+
+pattern ClassDictDef :: Name
+                     -> LabeledItems Type -> LabeledItems Type -> [DataConDef]
+pattern ClassDictDef conName superclasses methods =
+  [DataConDef conName
+     (Nest (BinderAnn (RecordTy (NoExt superclasses)))
+     (Nest (BinderAnn (RecordTy (NoExt methods))) Empty))]
+
+pattern ClassDictCon :: DataDef -> [Type]
+                     -> LabeledItems Atom -> LabeledItems Atom -> Atom
+pattern ClassDictCon def params superclasses methods =
+  DataCon def params 0 [Record superclasses, Record methods]
+
+-- TODO: Enable once https://gitlab.haskell.org//ghc/ghc/issues/13363 is fixed...
 -- {-# COMPLETE TypeVar, ArrowType, TabTy, Forall, TypeAlias, Effect, NoAnn, TC #-}
 
 -- TODO: Can we derive these generically? Or use Show/Read?
@@ -1492,7 +1593,8 @@ builtinNames = M.fromList
   , ("idxSetSize"  , OpExpr $ IdxSetSize ())
   , ("unsafeFromOrdinal", OpExpr $ UnsafeFromOrdinal () ())
   , ("toOrdinal"        , OpExpr $ ToOrdinal ())
-  , ("throwError" , OpExpr $ ThrowError ())
+  , ("throwError"     , OpExpr $ ThrowError ())
+  , ("throwException" , OpExpr $ ThrowException ())
   , ("ask"        , OpExpr $ PrimEffect () $ MAsk)
   , ("tell"       , OpExpr $ PrimEffect () $ MTell ())
   , ("get"        , OpExpr $ PrimEffect () $ MGet)
@@ -1500,12 +1602,14 @@ builtinNames = M.fromList
   , ("indexRef"   , OpExpr $ IndexRef () ())
   , ("inject"     , OpExpr $ Inject ())
   , ("select"     , OpExpr $ Select () () ())
-  , ("while"           , HofExpr $ While () ())
+  , ("while"           , HofExpr $ While ())
   , ("linearize"       , HofExpr $ Linearize ())
   , ("linearTranspose" , HofExpr $ Transpose ())
   , ("runReader"       , HofExpr $ RunReader () ())
   , ("runWriter"       , HofExpr $ RunWriter    ())
   , ("runState"        , HofExpr $ RunState  () ())
+  , ("runIO"           , HofExpr $ RunIO ())
+  , ("catchException"  , HofExpr $ CatchException ())
   , ("tiled"           , HofExpr $ Tile 0 () ())
   , ("tiledd"          , HofExpr $ Tile 1 () ())
   , ("TyKind"  , TCExpr $ TypeKind)
@@ -1514,6 +1618,9 @@ builtinNames = M.fromList
   , ("Int64"   , TCExpr $ BaseType $ Scalar Int64Type)
   , ("Int32"   , TCExpr $ BaseType $ Scalar Int32Type)
   , ("Word8"   , TCExpr $ BaseType $ Scalar Word8Type)
+  , ("Int32Ptr", TCExpr $ BaseType $ ptrTy $ Scalar Int32Type)
+  , ("Word8Ptr", TCExpr $ BaseType $ ptrTy $ Scalar Word8Type)
+  , ("PtrPtr"  , TCExpr $ BaseType $ ptrTy $ ptrTy $ Scalar Word8Type)
   , ("IntRange", TCExpr $ IntRange () ())
   , ("Ref"     , TCExpr $ RefType (Just ()) ())
   , ("PairType", TCExpr $ PairType () ())
@@ -1531,11 +1638,11 @@ builtinNames = M.fromList
   , ("cast", OpExpr  $ CastOp () ())
   , ("sliceOffset", OpExpr $ SliceOffset () ())
   , ("sliceCurry", OpExpr $ SliceCurry () ())
+  , ("alloc", OpExpr $ IOAlloc (Scalar Word8Type) ())
+  , ("free" , OpExpr $ IOFree ())
   , ("ptrOffset", OpExpr $ PtrOffset () ())
   , ("ptrLoad"  , OpExpr $ PtrLoad ())
-  , ("getPtr"   , OpExpr $ GetPtr () )
-  , ("makePtrType", OpExpr $ MakePtrType ())
-  , ("CharPtr"  , ptrTy Word8Type)
+  , ("ptrStore" , OpExpr $ PtrStore () ())
   , ("dataConTag", OpExpr $ DataConTag ())
   , ("toEnum"    , OpExpr $ ToEnum () ())
   ]
@@ -1543,8 +1650,7 @@ builtinNames = M.fromList
     vbinOp op = OpExpr $ VectorBinOp op () ()
     binOp  op = OpExpr $ ScalarBinOp op () ()
     unOp   op = OpExpr $ ScalarUnOp  op ()
-    ptrTy  ty = TCExpr $ BaseType $ PtrType $
-                  (AllocatedPtr, Heap CPU,  Scalar ty)
+    ptrTy  ty = PtrType (Heap CPU, ty)
 
 instance Store a => Store (PrimOp  a)
 instance Store a => Store (PrimCon a)
@@ -1562,7 +1668,8 @@ instance Store Atom
 instance Store Expr
 instance Store Block
 instance Store Decl
-instance Store EffectName
+instance Store RWS
+instance Store Effect
 instance Store EffectRow
 instance Store Direction
 instance Store UnOp
@@ -1576,6 +1683,5 @@ instance Store LitVal
 instance Store ScalarBaseType
 instance Store BaseType
 instance Store AddressSpace
-instance Store PtrOrigin
 instance Store Device
 instance Store DataConRefBinding

@@ -118,10 +118,6 @@ instance PrettyPrec BaseType where
     Vector sb -> atPrec ArgPrec $ "<" <> p vectorWidth <+> "x" <+> p sb <> ">"
     PtrType ty -> atPrec AppPrec $ "Ptr" <+> p ty
 
-instance Pretty PtrOrigin where
-  pretty AllocatedPtr = "a"
-  pretty DerivedPtr   = "d"
-
 instance Pretty AddressSpace where
   pretty Stack    = "stack"
   pretty (Heap d) = p (show d)
@@ -138,12 +134,16 @@ instance PrettyPrec ScalarBaseType where
 printDouble :: Double -> Doc ann
 printDouble x = p (double2Float x)
 
+printFloat :: Float -> Doc ann
+printFloat x = p $ reverse $ dropWhile (=='0') $ reverse $
+  showFFloat (Just 6) x ""
+
 instance Pretty LitVal where pretty = prettyFromPrettyPrec
 instance PrettyPrec LitVal where
   prettyPrec (Int64Lit   x) = atPrec ArgPrec $ p x
   prettyPrec (Int32Lit   x) = atPrec ArgPrec $ p x
   prettyPrec (Float64Lit x) = atPrec ArgPrec $ printDouble x
-  prettyPrec (Float32Lit x) = atPrec ArgPrec $ p x
+  prettyPrec (Float32Lit x) = atPrec ArgPrec $ printFloat  x
   prettyPrec (Word8Lit   x) = atPrec ArgPrec $ p $ show $ toEnum @Char $ fromIntegral x
   prettyPrec (PtrLit ty x) = atPrec ArgPrec $ "Ptr" <+> p ty <+> p (show x)
   prettyPrec (VecLit  l) = atPrec ArgPrec $ encloseSep "<" ">" ", " $ fmap p l
@@ -478,9 +478,7 @@ instance Pretty ImpFunction where
 instance Pretty ImpInstr where
   pretty (IFor a i n block) = forStr (RegularFor a) <+> p i <+> "<" <+> p n <>
                                 nest 4 (hardline <> p block)
-  pretty (IWhile cond body) = "while" <+>
-                                  nest 2 (p cond) <+> "do" <>
-                                  nest 4 (hardline <> p body)
+  pretty (IWhile body) = "while" <+> nest 2 (p body)
   pretty (ICond predicate cons alt) =
     "if" <+> p predicate <+> "then" <> nest 2 (hardline <> p cons) <>
     hardline <> "else" <> nest 2 (hardline <> p alt)
@@ -521,8 +519,8 @@ instance Pretty Output where
     benchName <> hardline <>
     "Compile time: " <> prettyDuration compileTime <> hardline <>
     "Run time:     " <> prettyDuration runTime <+>
-    (case stats of Just runs -> "\t" <> parens ("based on" <+> p runs <+> "runs")
-                   Nothing   -> "")
+    (case stats of Just (runs, _) -> "\t" <> parens ("based on" <+> p runs <+> "runs")
+                   Nothing        -> "")
     where benchName = case name of "" -> ""
                                    _  -> "\n" <> p name
   pretty (PassInfo name s) = "===" <+> p name <+> "===" <> hardline <> p s
@@ -592,7 +590,7 @@ instance PrettyPrec UExpr' where
       where kw = case dir of Fwd -> "for"
                              Rev -> "rof"
     UPi binder arr ty -> atPrec LowestPrec $
-      prettyUPiBinder binder <+> pretty arr <+> pLowest ty
+      prettyUBinder binder <+> pretty arr <+> pLowest ty
     UDecl decl body -> atPrec LowestPrec $ align $ p decl <> hardline
                                                          <> pLowest body
     UHole -> atPrec ArgPrec "_"
@@ -631,6 +629,13 @@ instance Pretty UDecl where
     align $ prettyUBinder b <+> "=" <> (nest 2 $ group $ line <> pLowest rhs)
   pretty (UData tyCon dataCons) =
     "data" <+> p tyCon <+> "where" <> nest 2 (hardline <> prettyLines dataCons)
+  pretty (UInterface cs def methods) =
+    "interface" <+> p cs <+> p def <> hardline <> prettyLines methods
+  pretty (UInstance bs ty methods) =
+    "instance" <+> p bs <+> p ty <> hardline <> prettyLines methods
+
+instance Pretty UMethodDef where
+  pretty (UMethodDef b rhs) = p b <+> "=" <+> p rhs
 
 instance Pretty UConDef where
   pretty (UConDef con bs) = p con <+> spaced bs
@@ -653,26 +658,25 @@ prettyUBinder (pat, ann) = p pat <> annDoc where
     Just ty -> ":" <> pApp ty
     Nothing -> mempty
 
-prettyUPiBinder :: UPiPatAnn -> Doc ann
-prettyUPiBinder (pat, ann) = patDoc <> p ann where
-  patDoc = case pat of
-    Just pat' -> pApp pat' <> ":"
-    Nothing -> mempty
-
 spaced :: (Foldable f, Pretty a) => f a -> Doc ann
 spaced xs = hsep $ map p $ toList xs
 
 instance Pretty EffectRow where
-  pretty (EffectRow [] Nothing) = mempty
+  pretty Pure = mempty
   pretty (EffectRow effs tailVar) =
-    braces $ hsep (punctuate "," (fmap prettyEff effs)) <> tailStr
+    braces $ hsep (punctuate "," (map p (toList effs))) <> tailStr
     where
-      prettyEff (effName, region) = p effName <+> p region
       tailStr = case tailVar of
         Nothing -> mempty
         Just v  -> "|" <> p v
 
-instance Pretty EffectName where
+instance Pretty Effect where
+  pretty eff = case eff of
+    RWSEffect rws h -> p rws <+> p h
+    ExceptionEffect -> "Except"
+    IOEffect        -> "IO"
+
+instance Pretty RWS where
   pretty eff = case eff of
     Reader -> "Read"
     Writer -> "Accum"

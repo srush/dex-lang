@@ -12,12 +12,13 @@ import Control.Monad
 import Control.Monad.Combinators.Expr
 import Control.Monad.Reader
 import Text.Megaparsec hiding (Label, State)
-import Text.Megaparsec.Char hiding (space)
+import Text.Megaparsec.Char hiding (space, eol)
+import qualified Text.Megaparsec.Char as MC
 import Data.Char (isLower)
 import Data.Functor
 import Data.List.NonEmpty (NonEmpty (..))
-import qualified Data.Map.Strict as M
 import Data.Void
+import qualified Data.Set as S
 import Data.String (fromString)
 import qualified Text.Megaparsec.Char.Lexer as L
 import qualified Text.Megaparsec.Debug
@@ -87,22 +88,22 @@ logLevel :: Parser LogLevel
 logLevel = do
   void $ try $ lexeme $ char '%' >> string "passes"
   passes <- many passName
-  void eol
+  eol
   case passes of
-    [] -> return $ LogAll
+    [] -> return LogAll
     _ -> return $ LogPasses passes
 
 logTime :: Parser LogLevel
 logTime = do
   void $ try $ lexeme $ char '%' >> string "time"
-  void eol
+  eol
   return PrintEvalTime
 
 logBench :: Parser LogLevel
 logBench = do
   void $ try $ lexeme $ char '%' >> string "bench"
   benchName <- stringLiteral
-  void eol
+  eol
   return $ PrintBench benchName
 
 passName :: Parser PassName
@@ -115,51 +116,24 @@ sourceBlock' :: Parser SourceBlock'
 sourceBlock' =
       proseBlock
   <|> topLevelCommand
-  <|> fmap (declsToModule . (:[])) (topDecl <* eolf)
-  <|> fmap (declsToModule . (:[])) (interfaceInstance <* eolf)
-  <|> fmap declsToModule (interfaceDef <* eolf)
-  <|> fmap (Command (EvalExpr Printed) . exprAsModule) (expr <* eol)
+  <|> liftM declToModule (topDecl <* eolf)
+  <|> liftM declToModule (instanceDef  <* eolf)
+  <|> liftM declToModule (interfaceDef <* eolf)
+  <|> liftM (Command (EvalExpr Printed) . exprAsModule) (expr <* eol)
   <|> hidden (some eol >> return EmptyLines)
   <|> hidden (sc >> eol >> return CommentLine)
-  where declsToModule = RunModule . UModule . toNest
+  where
+    declsToModule = RunModule . UModule . toNest
+    declToModule = declsToModule . (:[])
 
 proseBlock :: Parser SourceBlock'
 proseBlock = label "prose block" $ char '\'' >> fmap (ProseBlock . fst) (withSource consumeTillBreak)
 
-loadData :: Parser SourceBlock'
-loadData = do
-  symbol "load"
-  fmt <- dataFormat
-  s <- stringLiteral
-  symbol "as"
-  b <- patAnn
-  void eol
-  return $ LoadData b fmt s
-
 topLevelCommand :: Parser SourceBlock'
 topLevelCommand =
-      (liftM IncludeSourceFile includeSourceFile)
-  <|> loadData
-  <|> dumpData
+      liftM IncludeSourceFile includeSourceFile
   <|> explicitCommand
   <?> "top-level command"
-
-dataFormat :: Parser DataFormat
-dataFormat = do
-  s <- nameString
-  case s of
-    "dxo"  -> return DexObject
-    "dxbo" -> return DexBinaryObject
-    _      -> fail $ show s ++ " not a recognized data format (one of dxo|dxbo)"
-
-dumpData :: Parser SourceBlock'
-dumpData = do
-  symbol "dump"
-  fmt <- dataFormat
-  s <- stringLiteral
-  e <- blockOrExpr
-  void eol
-  return $ Command (Dump fmt s) (exprAsModule e)
 
 explicitCommand :: Parser SourceBlock'
 explicitCommand = do
@@ -179,7 +153,7 @@ exprAsModule :: UExpr -> (Name, UModule)
 exprAsModule e = (asGlobal v, UModule (toNest [d]))
   where
     v = mkName "_ans_"
-    d = ULet PlainLet (WithSrc (srcPos e) (UPatBinder (Bind (v:>()))), Nothing) e
+    d = ULet PlainLet (WithSrc (srcPos e) (nameToPat v), Nothing) e
 
 -- === uexpr ===
 
@@ -196,6 +170,7 @@ leafExpr = parens (mayPair $ makeExprParser leafExpr ops)
          <|> uLit
          <|> uPiType
          <|> uLamExpr
+         <|> uViewExpr
          <|> uForExpr
          <|> caseExpr
          <|> ifExpr
@@ -203,6 +178,7 @@ leafExpr = parens (mayPair $ makeExprParser leafExpr ops)
          <|> unitCon
          <|> (uLabeledExprs `fallBackTo` uVariantExpr)
          <|> uIsoSugar
+         <|> uDoSugar
          <?> "expression"
 
 containedExpr :: Parser UExpr
@@ -217,8 +193,9 @@ uType = expr
 uString :: Lexer UExpr
 uString = do
   (s, pos) <- withPos $ strLit
-  let cs = map (WithSrc (Just pos) . charExpr) s
-  return $ WithSrc (Just pos) $ UTabCon cs
+  let addSrc = WithSrc (Just pos)
+  let cs = map (addSrc . charExpr) s
+  return $ mkApp (addSrc "toList") $ addSrc $ UTabCon cs
 
 uLit :: Parser UExpr
 uLit = withSrc $ uLitParser
@@ -231,8 +208,7 @@ charExpr :: Char -> UExpr'
 charExpr c = UPrimExpr $ ConExpr $ Lit $ Word8Lit $ fromIntegral $ fromEnum c
 
 uVarOcc :: Parser UExpr
-uVarOcc = withSrc $ try $ (UVar . (:>())) <$> (occName <* notFollowedBy (sym ":"))
-  where occName = upperName <|> lowerName <|> symName
+uVarOcc = withSrc $ try $ (UVar . (:>())) <$> (anyName <* notFollowedBy (sym ":"))
 
 uHole :: Parser UExpr
 uHole = withSrc $ underscore $> UHole
@@ -247,9 +223,9 @@ topDecl = dataDef <|> topLet
 
 topLet :: Parser UDecl
 topLet = do
-  lAnn <- (char '@' >> letAnnStr <* (void eol <|> sc)) <|> return PlainLet
-  ~(ULet _ (p, ann) rhs, pos) <- withPos decl
-  let (ann', rhs') = addImplicitImplicitArgs pos ann rhs
+  lAnn <- (char '@' >> letAnnStr <* (eol <|> sc)) <|> return PlainLet
+  ~(ULet _ (p, ann) rhs) <- decl
+  let (ann', rhs') = addImplicitImplicitArgs ann rhs
   return $ ULet lAnn (p, ann') rhs'
 
 -- Given a type signature, find all "implicit implicit args": lower-case
@@ -275,7 +251,7 @@ findImplicitImplicitArgNames typ = filter isLowerCaseName $ envNames $
     -- recursive steps
     UVar _ -> mempty
     UPi (p, ann) _ ty ->
-      findVarsInAppLHS ann <> (findVarsInAppLHS ty `envDiff` boundUVars p)
+      foldMap findVarsInAppLHS ann <> (findVarsInAppLHS ty `envDiff` boundUVars p)
     UApp _ f x -> findVarsInAppLHS f <> findVarsInAppLHS x
     ULam (p, ann) _ x ->
       foldMap findVarsInAppLHS ann <> (findVarsInAppLHS x `envDiff` boundUVars p)
@@ -283,7 +259,7 @@ findImplicitImplicitArgNames typ = filter isLowerCaseName $ envNames $
     UFor _ _ _ -> error "Unexpected for in type annotation"
     UHole -> mempty
     UTypeAnn v ty -> findVarsInAppLHS v <> findVarsInAppLHS ty
-    UTabCon _ -> error "Unexpected table in type annotation"
+    UTabCon _ -> error "Unexpected table constructor in type annotation"
     UIndexRange low high ->
       foldMap findVarsInAppLHS low <> foldMap findVarsInAppLHS high
     UPrimExpr prim -> foldMap findVarsInAppLHS prim
@@ -298,77 +274,33 @@ findImplicitImplicitArgNames typ = filter isLowerCaseName $ envNames $
     UIntLit  _ -> mempty
     UFloatLit _ -> mempty
 
-addImplicitImplicitArgs :: SrcPos -> Maybe UType -> UExpr -> (Maybe UType, UExpr)
-addImplicitImplicitArgs _ Nothing e = (Nothing, e)
-addImplicitImplicitArgs sourcePos (Just typ) ex =
-  let (ty', e') = foldr (addImplicitArg sourcePos) (typ, ex) implicitVars
+addImplicitImplicitArgs :: Maybe UType -> UExpr -> (Maybe UType, UExpr)
+addImplicitImplicitArgs Nothing e = (Nothing, e)
+addImplicitImplicitArgs (Just typ) ex =
+  let (ty', e') = foldr addImplicitArg (typ, ex) implicitVars
   in (Just ty', e')
   where
     implicitVars = findImplicitImplicitArgNames typ
 
-    addImplicitArg :: SrcPos -> Name -> (UType, UExpr) -> (UType, UExpr)
-    addImplicitArg pos v (ty, e) =
-      ( WithSrc (Just pos) $ UPi (Just uPat, uTyKind) ImplicitArrow ty
-      , WithSrc (Just pos) $ ULam (uPat, Just uTyKind) ImplicitArrow e)
-      where
-        uPat = WithSrc (Just pos) $ UPatBinder $ Bind $ v:>()
-        k = if v == mkName "eff" then EffectRowKind else TypeKind
-        uTyKind = WithSrc (Just pos) $ UPrimExpr $ TCExpr k
+    addImplicitArg :: Name -> (UType, UExpr) -> (UType, UExpr)
+    addImplicitArg v (ty, e) =
+      ( ns $ UPi  (uPat, Nothing) ImplicitArrow ty
+      , ns $ ULam (uPat, Nothing) ImplicitArrow e)
+      where uPat = ns $ nameToPat v
 
-interfaceDef :: Parser [UDecl]
+superclassConstraints :: Parser [UType]
+superclassConstraints = optionalMonoid $ brackets $ uType `sepBy` sym ","
+
+interfaceDef :: Parser UDecl
 interfaceDef = do
   keyWord InterfaceKW
-  (tyCon, pos) <- withPos tyConDef
-  keyWord WhereKW
-  recordFieldsWithSrc <- withSrc $ interfaceRecordFields ":"
-  let (UConDef interfaceName uAnnBinderNest) = tyCon
-      record = URecordTy . NoExt <$> recordFieldsWithSrc
-      consName = mkInterfaceConsName interfaceName
-      varNames = fmap (\(Bind v) -> varName v) uAnnBinderNest
-      (WithSrc _ recordFields) = recordFieldsWithSrc
-      funDefs = mkFunDefs (pos, varNames, interfaceName) recordFields
-  return $ UData tyCon [UConDef consName (toNest [Ignore record])] : funDefs
-  where
-    -- From an interface
-    --   interface I a:Type b:Type where
-    --     f : a -> b
-    -- mkFunDefs generates the equivalent of the following function definition:
-    --   def f (instance# : I a b) ?=> : a -> b =
-    --     (I# {f=f,...}) = instance#
-    --     f
-    -- where I# is an automatically generated constructor of I.
-    mkFunDefs
-      :: (SrcPos, Nest Name, Name) -> LabeledItems UExpr -> [UDecl]
-    mkFunDefs meta (LabeledItems items) =
-        fmap (\(name, ty :| []) -> mkOneFunDef meta (name, ty)) $ M.toList items
-    mkOneFunDef :: (SrcPos, Nest Name, Name) -> (Label, UExpr) -> UDecl
-    mkOneFunDef (pos, typeVarNames, interfaceName) (fLabel, fType) =
-      ULet PlainLet (p, ann') rhs'
-      where
-        uAnnPat = ( Just $ WithSrc (Just pos) $ UPatBinder $ Bind $ instanceName :> ()
-                  , foldl mkUApp (var interfaceName) typeVarNames)
-        p = patb fLabel
-        ann = Just $ ns $ UPi uAnnPat ClassArrow fType
-
-        mkUApp func typeVarName =
-          ns $ UApp (PlainArrow ()) func (var typeVarName)
-        recordStr = "recordVar"
-        recordPat = ns $ UPatRecord $ Ext (labeledSingleton fLabel (patb
-          fLabel)) $ Just (ns (UPatBinder (Ignore ())))
-        conPat = ns $ UPatCon (mkInterfaceConsName interfaceName)
-          $ toNest [patb recordStr]
-
-        let1 = ULet PlainLet (conPat, Nothing) $ var instanceName
-        let2 = ULet PlainLet (recordPat, Nothing) $ var $ mkName recordStr
-        body = ns $ UDecl let1 (ns $ UDecl let2 (var (mkName fLabel)))
-        rhs = ns $ ULam (patb instanceStr, Nothing) ClassArrow body
-        (ann', rhs') = addImplicitImplicitArgs pos ann rhs
-
-        ns = WithSrc Nothing
-        patb s = ns $ UPatBinder $ Bind $ mkName s :> ()
-        instanceStr = mkNoShadowingStr "instance"
-        instanceName = mkName instanceStr
-        var name = ns $ UVar $ name :> ()
+  superclasses <- superclassConstraints
+  tyCon <- tyConDef
+  methods <- onePerLine $ do
+    v <- anyName
+    ty <- annot uType
+    return $ Bind $ v:>ty
+  return $ UInterface superclasses tyCon methods
 
 dataDef :: Parser UDecl
 dataDef = do
@@ -378,9 +310,15 @@ dataDef = do
   dataCons <- onePerLine dataConDef
   return $ UData tyCon dataCons
 
--- TODO: default to `Type` if unannoted
 tyConDef :: Parser UConDef
-tyConDef = UConDef <$> (upperName <|> symName) <*> manyNested namedBinder
+tyConDef = do
+  con <- upperName <|> symName
+  bs <- manyNested $ label "type constructor parameter" $ do
+    v <- lowerName
+    ty <- annot containedExpr <|> return tyKind
+    return $ Bind $ v :> ty
+  return $ UConDef con bs
+  where tyKind = ns $ UPrimExpr $ TCExpr TypeKind
 
 -- TODO: dependent types
 dataConDef :: Parser UConDef
@@ -395,52 +333,31 @@ decl = do
   rhs <- sym "=" >> blockOrExpr
   return $ lhs rhs
 
-interfaceInstance :: Parser UDecl
-interfaceInstance = do
+instanceDef :: Parser UDecl
+instanceDef = do
   keyWord InstanceKW
-  (p, pos) <- withPos letPat
-  ann <- annot uType
-  case mkConstructorNameVar ann of
-    Left err              -> fail err
-    Right constructorNameVar -> do
-      keyWord WhereKW
-      record <- withSrc $ (URecord . NoExt) <$> interfaceRecordFields "="
-      let constructorCall = constructorNameVar `mkApp` record
-          (ann', rhs') = addImplicitImplicitArgs pos (Just ann) constructorCall
-      return $ ULet InstanceLet (p, ann') rhs'
+  explicitArgs <- many defArg
+  constraints <- classConstraints
+  classTy <- uType
+  let implicitArgs = findImplicitImplicitArgNames $
+                       buildPiType explicitArgs Pure $
+                         foldr addClassConstraint classTy constraints
+  let argBinders =
+        [((ns (nameToPat v), Nothing), ImplicitArrow) | v <- implicitArgs] ++
+        explicitArgs                                                       ++
+        [((UnderscoreUPat, Just c)   , ClassArrow   ) | c <- constraints]
+  methods <- onePerLine instanceMethod
+  return $ UInstance (toNest argBinders) classTy methods
   where
-    -- Here, we are traversing the type annotation to retrieve the name of
-    -- the interface and generate its corresponding constructor. A valid type
-    -- annotation for an instance is composed of:
-    -- 1) implicit/class arguments
-    -- 2) a function whose name is the name of the interface applied to 0 or
-    --    more arguments
-    mkConstructorNameVar ann =
-      stripArrows ann >>= stripAppliedArgs >>= buildConstructor
+    addClassConstraint :: UType -> UType -> UType
+    addClassConstraint c ty = ns $ UPi (UnderscoreUPat, Just c) ClassArrow ty
 
-    stripArrows (WithSrc _ (UPi _ arr typ))
-      | arr `elem` [ClassArrow, ImplicitArrow] = stripArrows typ
-      | otherwise = Left ("Met invalid arrow '" ++ pprint arr ++ "' in type " ++
-                          "annotation of instance. Only class arrows and " ++
-                          "implicit arrows are allowed.")
-    stripArrows ann = Right ann
-
-    stripAppliedArgs ann
-      | (WithSrc _ (UApp _ func _)) <- ann = stripAppliedArgs func
-      | otherwise = Right ann
-
-    buildConstructor (WithSrc _ (UVar v)) =
-      Right $ (var . nameToStr . mkInterfaceConsName . varName) v
-    buildConstructor _ = Left ("Could not extract interface name from type " ++
-                               "annotation.")
-    var s = noSrc $ UVar $ mkName s :> ()
-
-interfaceRecordFields :: String -> Parser (LabeledItems UExpr)
-interfaceRecordFields bindwith =
-  fuse <$> onePerLine (do l <- fieldLabel
-                          e <- symbol bindwith *> expr
-                          return $ labeledSingleton l e)
-  where fuse = foldr (<>) NoLabeledItems
+instanceMethod :: Parser UMethodDef
+instanceMethod = do
+  v <- anyName
+  sym "="
+  rhs <- blockOrExpr
+  return $ UMethodDef (v:>()) rhs
 
 simpleLet :: Parser (UExpr -> UDecl)
 simpleLet = label "let binding" $ do
@@ -449,36 +366,41 @@ simpleLet = label "let binding" $ do
   return $ ULet PlainLet (p, ann)
 
 letPat :: Parser UPat
-letPat = nameAsPat $ upperName <|> lowerName <|> symName
+letPat = withSrc $ nameToPat <$> anyName
 
 funDefLet :: Parser (UExpr -> UDecl)
 funDefLet = label "function definition" $ mayBreak $ do
   keyWord DefKW
   v <- letPat
-  bs <- many arg
+  cs <- classConstraints
+  argBinders <- many defArg
   (eff, ty) <- label "result type annotation" $ annot effectiveType
-  when (null bs && eff /= Pure) $ fail "Nullary def can't have effects"
+  when (null argBinders && eff /= Pure) $ fail "Nullary def can't have effects"
+  let bs = map classAsBinder cs ++ argBinders
   let funTy = buildPiType bs eff ty
   let letBinder = (v, Just funTy)
-  let lamBinders = flip map bs $ \(p,_, arr) -> ((p,Nothing), arr)
-  return $ \body -> ULet PlainLet letBinder (buildLam lamBinders body)
+  let lamBinders = flip map bs \((p,_), arr) -> ((p,Nothing), arr)
+  return \body -> ULet PlainLet letBinder (buildLam lamBinders body)
   where
-    arg :: Parser (UPat, UType, UArrow)
-    arg = label "def arg" $ do
-      (p, ty) <-parens ((,) <$> pat <*> annot uType)
-      arr <- arrow (return ()) <|> return (PlainArrow ())
-      return (p, ty, arr)
+    classAsBinder :: UType -> UPatAnnArrow
+    classAsBinder ty = ((UnderscoreUPat, Just ty), ClassArrow)
 
-nameAsPat :: Parser Name -> Parser UPat
-nameAsPat p = withSrc $ (UPatBinder . Bind . (:>())) <$> p
+defArg :: Parser UPatAnnArrow
+defArg = label "def arg" $ do
+  (p, ty) <-parens ((,) <$> pat <*> annot uType)
+  arr <- arrow (return ()) <|> return (PlainArrow ())
+  return ((p, Just ty), arr)
 
-buildPiType :: [(UPat, UType, UArrow)] -> EffectRow -> UType -> UType
+classConstraints :: Parser [UType]
+classConstraints = label "class constraints" $
+  optionalMonoid $ brackets $ mayNotPair $ uType `sepBy` sym ","
+
+buildPiType :: [UPatAnnArrow] -> EffectRow -> UType -> UType
 buildPiType [] Pure ty = ty
 buildPiType [] _ _ = error "shouldn't be possible"
-buildPiType ((p, patTy, arr):bs) eff resTy = WithSrc pos $ case bs of
-  [] -> UPi (Just p, patTy) (fmap (const eff ) arr) resTy
-  _  -> UPi (Just p, patTy) (fmap (const Pure) arr) $ buildPiType bs eff resTy
-  where WithSrc pos _ = patTy
+buildPiType (((p, patTy), arr):bs) eff resTy = ns case bs of
+  [] -> UPi (p, patTy) (fmap (const eff ) arr) resTy
+  _  -> UPi (p, patTy) (fmap (const Pure) arr) $ buildPiType bs eff resTy
 
 effectiveType :: Parser (EffectRow, UType)
 effectiveType = (,) <$> effects <*> uType
@@ -487,15 +409,20 @@ effects :: Parser EffectRow
 effects = braces someEffects <|> return Pure
   where
     someEffects = do
-      effs <- liftM2 (,) effectName lowerName `sepBy` sym ","
+      effs <- effect `sepBy` sym ","
       v <- optional $ symbol "|" >> lowerName
-      return $ EffectRow effs v
+      return $ EffectRow (S.fromList effs) v
 
-effectName :: Parser EffectName
-effectName =     (keyWord WriteKW $> Writer)
-             <|> (keyWord ReadKW  $> Reader)
-             <|> (keyWord StateKW $> State)
-             <?> "effect name (Accum|Read|State)"
+effect :: Parser Effect
+effect =   (RWSEffect <$> rwsName <*> anyCaseName)
+       <|> (keyWord ExceptKW $> ExceptionEffect)
+       <|> (keyWord IOKW     $> IOEffect)
+       <?> "effect (Accum h | Read h | State h | Except | IO)"
+
+rwsName :: Parser RWS
+rwsName =   (keyWord WriteKW $> Writer)
+        <|> (keyWord ReadKW  $> Reader)
+        <|> (keyWord StateKW $> State)
 
 uLamExpr :: Parser UExpr
 uLamExpr = do
@@ -524,6 +451,14 @@ buildFor pos dir binders body = case binders of
   [] -> body
   b:bs -> WithSrc (Just pos) $ UFor dir b $ buildFor pos dir bs body
 
+uViewExpr :: Parser UExpr
+uViewExpr = do
+  keyWord ViewKW
+  bs <- some patAnn
+  argTerm
+  body <- blockOrExpr
+  return $ buildLam (zip bs (repeat TabArrow)) body
+
 uForExpr :: Parser UExpr
 uForExpr = do
   ((dir, trailingUnit), pos) <- withPos $
@@ -533,23 +468,24 @@ uForExpr = do
       <|> (keyWord Rof_KW $> (Rev, True ))
   e <- buildFor pos dir <$> (some patAnn <* argTerm) <*> blockOrExpr
   if trailingUnit
-    then return $ noSrc $ UDecl (ULet PlainLet underscorePat e) unit
+    then return $ ns $ UDecl (ULet PlainLet (UnderscoreUPat, Nothing) e) $
+                                ns unitExpr
     else return e
-  where
-    underscorePat :: UPatAnn
-    underscorePat = (noSrc $ UPatBinder $ Ignore (), Nothing)
 
-    unit :: UExpr
-    unit = noSrc $ UPrimExpr $ ConExpr UnitCon
+nameToPat :: Name -> UPat'
+nameToPat v = UPatBinder (Bind (v:>()))
 
-noSrc :: a -> WithSrc a
-noSrc = WithSrc Nothing
+unitExpr :: UExpr'
+unitExpr = UPrimExpr $ ConExpr UnitCon
+
+ns :: a -> WithSrc a
+ns = WithSrc Nothing
 
 blockOrExpr :: Parser UExpr
 blockOrExpr =  block <|> expr
 
 unitCon :: Parser UExpr
-unitCon = withSrc $ symbol "()" $> (UPrimExpr $ ConExpr $ UnitCon)
+unitCon = withSrc $ symbol "()" $> unitExpr
 
 uTabCon :: Parser UExpr
 uTabCon = withSrc $ do
@@ -571,7 +507,7 @@ wrapUStatements statements = case statements of
   (s, pos):rest -> WithSrc (Just pos) $ case s of
     Left  d -> UDecl d $ wrapUStatements rest
     Right e -> UDecl d $ wrapUStatements rest
-      where d = ULet PlainLet (WithSrc (Just pos) (UPatBinder (Ignore ())), Nothing) e
+      where d = ULet PlainLet (UnderscoreUPat, Nothing) e
   [] -> error "Shouldn't be reachable"
 
 uStatement :: Parser UStatement
@@ -585,16 +521,17 @@ uPiType = withSrc $ UPi <$> piBinderPat <*> arrow effects <*> uType
           b <- annBinder
           return $ case b of
             Bind (n:>a@(WithSrc pos _)) ->
-              (Just $ WithSrc pos $ UPatBinder $ Bind $ n:>(), a)
-            Ignore a -> (Nothing, a)
+              (WithSrc pos $ nameToPat n, Just a)
+            Ignore a -> (UnderscoreUPat, Just a)
 
 annBinder :: Parser UAnnBinder
 annBinder = try $ namedBinder <|> anonBinder
 
 namedBinder :: Parser UAnnBinder
-namedBinder = label "named annoted binder" $ lowerName
-                                           >>= \v  -> sym ":" >> containedExpr
-                                           >>= \ty -> return $ Bind (v:>ty)
+namedBinder = label "named annoted binder" $ do
+  v <- lowerName
+  ty <- annot containedExpr
+  return $ Bind (v:>ty)
 
 anonBinder :: Parser UAnnBinder
 anonBinder =
@@ -621,16 +558,34 @@ ifExpr :: Parser UExpr
 ifExpr = withSrc $ do
   keyWord IfKW
   e <- expr
-  withIndent $ mayNotBreak $ do
-    alt1 <- keyWord ThenKW >> blockOrExpr
-    nextLine
-    alt2 <- keyWord ElseKW >> blockOrExpr
-    return $ UCase e
-      [ UAlt (globalEnumPat "True") alt1
+  (alt1, maybeAlt2) <- oneLineThenElse <|> blockThenElse
+  let alt2 = case maybeAlt2 of
+        Nothing  -> ns unitExpr
+        Just alt -> alt
+  return $ UCase e
+      [ UAlt (globalEnumPat "True" ) alt1
       , UAlt (globalEnumPat "False") alt2]
 
+oneLineThenElse :: Parser (UExpr, Maybe UExpr)
+oneLineThenElse = do
+  keyWord ThenKW
+  alt1 <- eitherP block expr
+  case alt1 of
+    Left  e -> return (e, Nothing)
+    Right e -> do
+      alt2 <- optional $ keyWord ElseKW >> blockOrExpr
+      return (e, alt2)
+
+blockThenElse :: Parser (UExpr, Maybe UExpr)
+blockThenElse = withIndent $ mayNotBreak $ do
+  alt1 <- keyWord ThenKW >> blockOrExpr
+  alt2 <- optional $ do
+    try $ nextLine >> keyWord ElseKW
+    blockOrExpr
+  return (alt1, alt2)
+
 globalEnumPat :: Tag -> UPat
-globalEnumPat s = noSrc $ UPatCon (GlobalName s) Empty
+globalEnumPat s = ns $ UPatCon (GlobalName s) Empty
 
 onePerLine :: Parser a -> Parser [a]
 onePerLine p =   liftM (:[]) p
@@ -650,8 +605,8 @@ leafPat =
       <|> (variantPat `fallBackTo` recordPat)
       <|> brackets (UPatTable <$> leafPat `sepBy` sym ",")
   )
-  where pun pos l = WithSrc (Just pos) $ UPatBinder $ Bind (mkName l:>())
-        def pos = WithSrc (Just pos) $ UPatBinder $ Ignore ()
+  where pun pos l = WithSrc (Just pos) $ nameToPat $ mkName l
+        def pos = WithSrc (Just pos) $ UPatBinder (Ignore ())
         variantPat = parseVariant leafPat UPatVariant UPatVariantLift
         recordPat = UPatRecord <$> parseLabeledItems "," "=" leafPat
                                                      (Just pun) (Just def)
@@ -712,15 +667,20 @@ uLabeledExprs = withSrc $
 varPun :: SrcPos -> Label -> UExpr
 varPun pos str = WithSrc (Just pos) $ UVar (mkName str :> ())
 
+uDoSugar :: Parser UExpr
+uDoSugar = withSrc $ do
+  keyWord DoKW
+  body <- blockOrExpr
+  return $ ULam (WithSrc Nothing UPatUnit, Nothing) (PlainArrow ()) body
+
 uIsoSugar :: Parser UExpr
 uIsoSugar = withSrc (char '#' *> options) where
   options = (recordFieldIso <$> fieldLabel)
             <|> char '?' *> (variantFieldIso <$> fieldLabel)
             <|> char '&' *> (recordZipIso <$> fieldLabel)
             <|> char '|' *> (variantZipIso <$> fieldLabel)
-  ns = WithSrc Nothing
   var s = ns $ UVar $ mkName s :> ()
-  patb s = ns $ UPatBinder $ Bind $ mkName s :> ()
+  patb s = ns $ nameToPat $ mkName s
   plain = PlainArrow ()
   lam p b = ns $ ULam (p, Nothing) plain b
   recordFieldIso field =
@@ -924,8 +884,8 @@ mkSymName s = mkName $ "(" <> s <> ")"
 prefixNegOp :: Operator Parser UExpr
 prefixNegOp = Prefix $ label "negation" $ do
   ((), pos) <- withPos $ sym "-"
-  let f = WithSrc (Just pos) $ UVar $ mkName "neg" :> ()
-  return $ \case
+  let f = WithSrc (Just pos) "neg"
+  return \case
     -- Special case: negate literals directly
     WithSrc litpos (IntLitExpr i)
       -> WithSrc (joinPos (Just pos) litpos) (IntLitExpr (-i))
@@ -947,10 +907,10 @@ infixArrow :: Parser (UType -> UType -> UType)
 infixArrow = do
   notFollowedBy (sym "=>")  -- table arrows have special fixity
   (arr, pos) <- withPos $ arrow effects
-  return $ \a b -> WithSrc (Just pos) $ UPi (Nothing, a) arr b
+  return \a b -> WithSrc (Just pos) $ UPi (UnderscoreUPat, Just a) arr b
 
 mkArrow :: Arrow -> UExpr -> UExpr -> UExpr
-mkArrow arr a b = joinSrc a b $ UPi (Nothing, a) arr b
+mkArrow arr a b = joinSrc a b $ UPi (UnderscoreUPat, Just a) arr b
 
 withSrc :: Parser a -> Parser (WithSrc a)
 withSrc p = do
@@ -992,23 +952,10 @@ inpostfix' :: Parser a -> Parser (a -> Maybe a -> a) -> Operator Parser a
 inpostfix' p op = Postfix $ do
   f <- op
   rest <- optional p
-  return $ \x -> f x rest
+  return \x -> f x rest
 
 mkName :: String -> Name
 mkName s = Name SourceName (fromString s) 0
-
-nameToStr :: Name -> String
-nameToStr = tagToStr . nameTag
-
--- This function is used to generate a string that is guaranteed to never shadow
--- any user-defined name, as "#" is an invalid identifier character in normal
--- source code.
-mkNoShadowingStr :: String -> String
-mkNoShadowingStr = (++ "#")
-
-mkInterfaceConsName :: Name -> Name
-mkInterfaceConsName =
-  GlobalName . fromString . mkNoShadowingStr . nameToStr
 
 -- === lexemes ===
 
@@ -1017,7 +964,8 @@ type Lexer = Parser
 
 data KeyWord = DefKW | ForKW | For_KW | RofKW | Rof_KW | CaseKW | OfKW
              | ReadKW | WriteKW | StateKW | DataKW | InterfaceKW
-             | InstanceKW | WhereKW | IfKW | ThenKW | ElseKW
+             | InstanceKW | WhereKW | IfKW | ThenKW | ElseKW | DoKW
+             | ExceptKW | IOKW | ViewKW
 
 upperName :: Lexer Name
 upperName = liftM mkName $ label "upper-case name" $ lexeme $
@@ -1026,6 +974,12 @@ upperName = liftM mkName $ label "upper-case name" $ lexeme $
 lowerName  :: Lexer Name
 lowerName = liftM mkName $ label "lower-case name" $ lexeme $
   checkNotKeyword $ (:) <$> lowerChar <*> many nameTailChar
+
+anyCaseName  :: Lexer Name
+anyCaseName = lowerName <|> upperName
+
+anyName  :: Lexer Name
+anyName = lowerName <|> upperName <|> symName
 
 checkNotKeyword :: Parser String -> Parser String
 checkNotKeyword p = try $ do
@@ -1050,15 +1004,19 @@ keyWord kw = lexeme $ try $ string s >> notFollowedBy nameTailChar
       ReadKW  -> "Read"
       WriteKW -> "Accum"
       StateKW -> "State"
+      ExceptKW -> "Except"
+      IOKW     -> "IO"
       DataKW -> "data"
       InterfaceKW -> "interface"
       InstanceKW -> "instance"
       WhereKW -> "where"
+      DoKW   -> "do"
+      ViewKW -> "view"
 
 keyWordStrs :: [String]
 keyWordStrs = ["def", "for", "for_", "rof", "rof_", "case", "of", "llam",
-               "Read", "Write", "Accum", "data", "interface",
-               "instance", "where", "if", "then", "else"]
+               "Read", "Write", "Accum", "Except", "IO", "data", "interface",
+               "instance", "where", "if", "then", "else", "do", "view"]
 
 fieldLabel :: Lexer Label
 fieldLabel = label "field label" $ lexeme $
@@ -1172,6 +1130,9 @@ mayPair p = local (\ctx -> ctx { canPair = True }) p
 mayNotPair :: Parser a -> Parser a
 mayNotPair p = local (\ctx -> ctx { canPair = False }) p
 
+optionalMonoid :: Monoid a => Parser a -> Parser a
+optionalMonoid p = p <|> return mempty
+
 nameString :: Parser String
 nameString = lexeme . try $ (:) <$> lowerChar <*> many alphaNumChar
 
@@ -1214,7 +1175,7 @@ withPos p = do
 
 nextLine :: Parser ()
 nextLine = do
-  void eol
+  eol
   n <- asks curIndent
   void $ mayNotBreak $ many $ try (sc >> eol)
   void $ replicateM n (char ' ')
@@ -1231,8 +1192,11 @@ withIndent p = do
   indent <- liftM length $ some (char ' ')
   local (\ctx -> ctx { curIndent = curIndent ctx + indent }) $ p
 
+eol :: Parser ()
+eol = void MC.eol
+
 eolf :: Parser ()
-eolf = void eol <|> eof
+eolf = eol <|> eof
 
 failIf :: Bool -> String -> Parser ()
 failIf True s = fail s

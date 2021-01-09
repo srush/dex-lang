@@ -70,18 +70,18 @@ parallelTraverseExpr expr = case expr of
     -- TODO: functionEffs is an overapproximation of the effects that really appear inside
     refs <- gets activeAccs
     let allowedRegions = foldMap (\(varType -> RefTy (Var reg) _) -> reg @> ()) refs
-    bodyEffs <- substEmbedR $ functionEffs fbody
-    let onlyAllowedEffects = flip all bodyEffs $ \(eff, reg) -> eff == Writer && reg `isin` allowedRegions
-    case onlyAllowedEffects of
+    (EffectRow bodyEffs t) <- substEmbedR $ functionEffs fbody
+    let onlyAllowedEffects = all (parallelizableEffect allowedRegions) $ toList bodyEffs
+    case t == Nothing && onlyAllowedEffects of
       True -> do
         b' <- substEmbedR b
         liftM Atom $ runLoopM $ withLoopBinder b' $ buildParallelBlock $ asABlock body
       False -> nothingSpecial
   Hof (RunWriter (BinaryFunVal h b _ body)) -> do
     ~(RefTy _ accTy) <- traverseAtom substTraversalDef $ binderType b
-    liftM Atom $ emitRunWriter (binderNameHint b) accTy $ \ref@(Var refVar) -> do
+    liftM Atom $ emitRunWriter (binderNameHint b) accTy \ref@(Var refVar) -> do
       let RefTy h' _ = varType refVar
-      modify $ \accEnv -> accEnv { activeAccs = activeAccs accEnv <> b @> refVar }
+      modify \accEnv -> accEnv { activeAccs = activeAccs accEnv <> b @> refVar }
       extendR (h @> h' <> b @> ref) $ evalBlockE parallelTrav body
   -- TODO: Do some alias analysis. This is not fundamentally hard, but it is a little annoying.
   --       We would have to track not only the base references, but also all the aliases, along
@@ -95,7 +95,13 @@ parallelTraverseExpr expr = case expr of
   where
     nothingSpecial = traverseExpr parallelTrav expr
     disallowRef ~(Var refVar) =
-      modify $ \accEnv -> accEnv { activeAccs = activeAccs accEnv `envDiff` (refVar @> ()) }
+      modify \accEnv -> accEnv { activeAccs = activeAccs accEnv `envDiff` (refVar @> ()) }
+
+parallelizableEffect :: Env () -> Effect -> Bool
+parallelizableEffect allowedRegions effect = case effect of
+  RWSEffect Writer h | h `isin` allowedRegions -> True
+  -- TODO: we should be able to parallelize the exception effect too
+  _ -> False
 
 -- Precondition: This is never called with no binders in the loop env
 buildParallelBlock :: ABlock -> LoopM Atom
@@ -197,7 +203,7 @@ emitLoops buildPureLoop (ABlock decls result) = do
   let buildBody pari = do
         is <- unpackConsList pari
         extendR (newEnv lbs is) $ do
-          ctxEnv <- flip traverseNames dapps $ \_ (arr, idx) ->
+          ctxEnv <- flip traverseNames dapps \_ (arr, idx) ->
             -- XXX: arr is namespaced in the new program
             foldM appTryReduce arr =<< substEmbedR idx
           extendR ctxEnv $ evalBlockE appReduceTraversalDef $ Block decls $ Atom result
@@ -205,18 +211,18 @@ emitLoops buildPureLoop (ABlock decls result) = do
     True -> buildPureLoop (Bind $ "pari" :> iterTy) buildBody
     False -> do
       body <- do
-        buildLam (Bind $ "gtid" :> IdxRepTy) PureArrow $ \gtid -> do
-          buildLam (Bind $ "nthr" :> IdxRepTy) PureArrow $ \nthr -> do
+        buildLam (Bind $ "gtid" :> IdxRepTy) PureArrow \gtid -> do
+          buildLam (Bind $ "nthr" :> IdxRepTy) PureArrow \nthr -> do
             let threadRange = TC $ ParIndexRange iterTy gtid nthr
             let accTys = mkConsListTy $ fmap (derefType . varType) newRefs
-            emitRunWriter "refsList" accTys $ \localRefsList -> do
+            emitRunWriter "refsList" accTys \localRefsList -> do
               localRefs <- unpackRefConsList localRefsList
-              buildFor Fwd (Bind $ "tidx" :> threadRange) $ \tidx -> do
+              buildFor Fwd (Bind $ "tidx" :> threadRange) \tidx -> do
                 pari <- emitOp $ Inject tidx
                 extendR (newEnv oldRefNames localRefs) $ buildBody pari
       (ans, updateList) <- fromPair =<< (emit $ Hof $ PTileReduce iterTy body)
       updates <- unpackConsList updateList
-      forM_ (zip newRefs updates) $ \(ref, update) ->
+      forM_ (zip newRefs updates) \(ref, update) ->
         emitOp $ PrimEffect (Var ref) $ MTell update
       return ans
     where

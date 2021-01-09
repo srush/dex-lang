@@ -16,16 +16,16 @@ rosenbrock2 : ((Fin 2)=>Float) -> Float =
 ' Min should be at 1.0, 1.0
 
 :p rosenbrock 1.0 1.000
-> 0.0
+> 0.
 
 :p rosenbrock2 [1.0, 1.000]
-> 0.0
+> 0.
 
 :p rosenbrock 1.0 1.02
-> 3.199994e-2
+> 0.032
 
 :p rosenbrock2 [1.0, 1.02]
-> 3.199994e-2
+> 0.032
 
 
 ' ## Helper functions
@@ -43,7 +43,7 @@ randBounded : Key -> (d=>Float)->(d=>Float)->(d=>Float) =
     for i. lb.i + ((rand $ ixkey key i) * (ub.i - lb.i))
 
 :p randBounded (newKey 4) [1.0,  -2.0] [-1.0,  2.0]
-> [-0.35101044, 1.4935503]
+> [-0.35101, 1.49355]
 
 ' ## The Optimizer itself.
 We have **arguments**:
@@ -57,7 +57,6 @@ We have **arguments**:
 ' **Returns**: the optimal point found with-in the bounds on the input domain of `f`.
 
 def optimize
-      (d:Type) ?->
       (np':Int)                                        -- number of particles
       (niter:Int)                                      -- number of iterations
       (key:Key)                                        -- random seed
@@ -72,7 +71,7 @@ def optimize
             minbyfst pbests.p (f newPositions.p, newPositions.p)
         newGbest:(Float & d=>Float) =
             minbyfst gbest (minimumbyfst newPbests)
-        (keyG, keyP, keyNext) = splitKey3 keyL
+        [keyG, keyP, keyNext] = splitKey keyL
         (gscore, gloc) = gbest
         plocs = map snd pbests
         gVel:(np=>d=>Float) = for p i.
@@ -87,7 +86,7 @@ def optimize
         (keyNext,newGbest,newPbests,newPositions,newVelocities)
     randInit1 = \keyI1. randBounded keyI1 lb ub
     randInit  = \keyI. for p:np. randInit1 $ ixkey keyI p
-    (keyPos, keyVel, keyLoop) = splitKey3 key
+    [keyPos, keyVel, keyLoop] = splitKey key
     initPositions:(np=>d=>Float) = randInit keyPos
     initVelocities:(np=>d=>Float) = randInit keyVel
     initPs:(np=>(Float & d=>Float)) = for p. (f initPositions.p, initPositions.p)
@@ -103,13 +102,13 @@ Run it for more iterations and result should improve.
 Which it indeed does.
 
 :p optimize 50 10 (newKey 0) rosenbrock2 ([-10.0, -10.0],[20.0, 20.0]) (0.5,0.3,0.4)
-> [3.7902741, 14.911411]
+> [0.076986, 0.232818]
 
 :p optimize 50 20 (newKey 0) rosenbrock2 ([-10.0, -10.0],[20.0, 20.0]) (0.5,0.3,0.4)
-> [1.737732, 3.1227117]
+> [0.90125, 0.750447]
 
 :p optimize 50 100 (newKey 0) rosenbrock2 ([-10.0, -10.0],[20.0, 20.0]) (0.5,0.3,0.4)
-> [1.0062296, 1.0128789]
+> [0.999069, 0.998192]
 
 :p optimize 50 1000 (newKey 0) rosenbrock2 ([-10.0, -10.0],[20.0, 20.0]) (0.5,0.3,0.4)
-> [1.0, 1.0]
+> [1., 1.]

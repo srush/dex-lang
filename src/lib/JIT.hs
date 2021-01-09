@@ -33,7 +33,6 @@ import Control.Monad.State.Strict
 import Control.Monad.Reader
 import Data.ByteString.Short (toShort)
 import qualified Data.ByteString.Char8 as B
-import Data.List (concat)
 import Data.String
 import Data.Foldable
 import Data.Text.Prettyprint.Doc
@@ -91,18 +90,20 @@ compileFunction logger fun@(ImpFunction f bs body) = case cc of
     extraSpecs <- gets funSpecs
     return ([L.GlobalDefinition mainFun], extraSpecs)
   EntryFun requiresCUDA -> return $ runCompile CPU $ do
+    (streamFDParam , streamFDOperand ) <- freshParamOpPair attrs $ i32
     (argPtrParam   , argPtrOperand   ) <- freshParamOpPair attrs $ hostPtrTy i64
     (resultPtrParam, resultPtrOperand) <- freshParamOpPair attrs $ hostPtrTy i64
-    argOperands <- forM (zip [0..] argTys) $ \(i, ty) ->
+    initializeOutputStream streamFDOperand
+    argOperands <- forM (zip [0..] argTys) \(i, ty) ->
       gep argPtrOperand (i64Lit i) >>= castLPtr (scalarTy ty) >>= load
     when (toBool requiresCUDA) ensureHasCUDAContext
     results <- extendOperands (newEnv bs argOperands) $ compileBlock body
-    forM_ (zip [0..] results) $ \(i, x) ->
+    forM_ (zip [0..] results) \(i, x) ->
       gep resultPtrOperand (i64Lit i) >>= castLPtr (L.typeOf x) >>= flip store x
     mainFun <- makeFunction (asLLVMName name)
-                 [argPtrParam, resultPtrParam] (Just $ i64Lit 0)
+                 [streamFDParam, argPtrParam, resultPtrParam] (Just $ i64Lit 0)
     extraSpecs <- gets funSpecs
-    return ([L.GlobalDefinition mainFun], extraSpecs)
+    return ([L.GlobalDefinition mainFun, outputStreamPtrDef], extraSpecs)
     where attrs = [L.NoAlias, L.NoCapture, L.NonNull]
   CUDAKernelLaunch -> do
     (CUDAKernel kernelText) <- compileCUDAKernel logger $ impKernelToLLVMGPU fun
@@ -200,8 +201,8 @@ compileInstr instr = case instr of
   IFor d i n body  -> [] <$ do
     n' <- compileExpr n
     compileLoop d i n' $ compileVoidBlock body
-  IWhile cond body -> [] <$ do
-    compileWhile (head <$> compileBlock cond) (compileVoidBlock body)
+  IWhile body -> [] <$ do
+    compileWhile (head <$> compileBlock body)
   ICond p cons alt -> [] <$ do
     p' <- compileExpr p >>= (`asIntWidth` i1)
     compileIf p' (compileVoidBlock cons) (compileVoidBlock alt)
@@ -265,15 +266,15 @@ compileInstr instr = case instr of
         GPU -> cuMemAlloc elemTy numBytes
     where elemTy = scalarTy t
   Free ptr -> [] <$ do
-    let PtrType (_, addr, _) = getIType ptr
+    let PtrType (addr, _) = getIType ptr
     ptr' <- compileExpr ptr
     case addr of
       Heap CPU -> free      ptr'
       Heap GPU -> cuMemFree ptr'
       Stack -> error "Shouldn't be freeing alloca"
   MemCopy dest src numel -> [] <$ do
-    let PtrType (_, destAddr, ty) = getIType dest
-    let PtrType (_, srcAddr , _ ) = getIType src
+    let PtrType (destAddr, ty) = getIType dest
+    let PtrType (srcAddr , _ ) = getIType src
     destDev <- deviceFromAddr destAddr
     srcDev  <- deviceFromAddr srcAddr
     dest' <- compileExpr dest >>= castVoidPtr
@@ -302,6 +303,10 @@ compileInstr instr = case instr of
         GT -> emitInstr dt $ L.FPTrunc x dt []
       (L.FloatingPointType _, L.IntegerType _) -> emitInstr dt $ L.FPToSI x dt []
       (L.IntegerType _, L.FloatingPointType _) -> emitInstr dt $ L.SIToFP x dt []
+      (L.PointerType _ _, L.PointerType eltTy _) -> castLPtr eltTy x
+      (L.IntegerType 64 , ptrTy@(L.PointerType _ _)) ->
+        emitInstr ptrTy $ L.IntToPtr x ptrTy []
+      (L.PointerType _ _, L.IntegerType 64) -> emitInstr i64 $ L.PtrToInt x i64 []
       _ -> error $ "Unsupported cast"
   ICall f@(fname:> IFunType cc argTys resultTys) args -> do
     -- TODO: consider having a separate calling convention specification rather
@@ -310,8 +315,7 @@ compileInstr instr = case instr of
     let resultTys' = map scalarTy resultTys
     case cc of
       FFIFun -> do
-        let [resultTy] = resultTys'
-        ans <- emitInstr resultTy $ externCall (makeFunSpec f) args'
+        ans <- emitExternCall (makeFunSpec f) args'
         return [ans]
       FFIMultiResultFun -> do
         resultPtr <- makeMultiResultAlloc resultTys'
@@ -366,14 +370,13 @@ compileIf cond tb fb = do
   fb
   finishBlock (L.Br contName []) contName
 
-compileWhile :: Compile Operand -> Compile () -> Compile ()
-compileWhile compileCond compileBody = do
+compileWhile :: Compile Operand -> Compile ()
+compileWhile compileBody = do
   loopBlock <- freshName "whileLoop"
   nextBlock <- freshName "whileCont"
-  entryCond <- compileCond >>= (`asIntWidth` i1)
+  entryCond <- compileBody >>= (`asIntWidth` i1)
   finishBlock (L.CondBr entryCond loopBlock nextBlock []) loopBlock
-  compileBody
-  loopCond <- compileCond >>= (`asIntWidth` i1)
+  loopCond <- compileBody >>= (`asIntWidth` i1)
   finishBlock (L.CondBr loopCond loopBlock nextBlock []) nextBlock
 
 throwRuntimeError :: Compile ()
@@ -580,6 +583,21 @@ _gpuDebugPrint i32Val = do
     genericPtrTy ty = L.PointerType ty $ L.AddrSpace 0
     vprintfSpec = ExternFunSpec "vprintf" i32 [] [] [genericPtrTy i8, genericPtrTy i8]
 
+-- Takes a single int64 payload. TODO: implement a varargs version
+_debugPrintf :: String -> Operand -> Compile ()
+_debugPrintf fmtStr x = do
+  let chars = map (C.Int 8) $ map (fromIntegral . fromEnum) fmtStr ++ [0]
+  let formatStrArr = L.ConstantOperand $ C.Array i8 chars
+  formatStrPtr <- alloca (length chars) i8
+  castLPtr (L.typeOf formatStrArr) formatStrPtr >>= (`store` formatStrArr)
+  void $ emitExternCall printfSpec [formatStrPtr, x]
+  where printfSpec = ExternFunSpec "printf" i32 [] [] [hostVoidp, i64]
+
+_debugPrintfPtr :: String -> Operand -> Compile ()
+_debugPrintfPtr s x = do
+  x' <- emitInstr i64 $ L.PtrToInt x i64 []
+  _debugPrintf s x'
+
 compileBlock :: ImpBlock -> Compile [Operand]
 compileBlock (ImpBlock Empty result) = traverse compileExpr result
 compileBlock (ImpBlock (Nest decl rest) result) = do
@@ -604,7 +622,7 @@ compileExpr expr = case expr of
 packArgs :: [Operand] -> Compile Operand
 packArgs elems = do
   arr <- alloca (length elems) hostVoidp
-  forM_ (zip [0..] elems) $ \(i, e) -> do
+  forM_ (zip [0..] elems) \(i, e) -> do
     eptr <- alloca 1 $ L.typeOf e
     store eptr e
     earr <- gep arr $ i32Lit i
@@ -613,7 +631,7 @@ packArgs elems = do
 
 unpackArgs :: Operand -> [L.Type] -> Compile [Operand]
 unpackArgs argArrayPtr types =
-  forM (zip [0..] types) $ \(i, ty) -> do
+  forM (zip [0..] types) \(i, ty) -> do
     argVoidPtr <- gep argArrayPtr $ i64Lit i
     argPtr <- castLPtr (hostPtrTy ty) argVoidPtr
     load =<< load argPtr
@@ -621,7 +639,7 @@ unpackArgs argArrayPtr types =
 makeMultiResultAlloc :: [L.Type] -> Compile Operand
 makeMultiResultAlloc tys = do
   resultsPtr <- alloca (length tys) hostVoidp
-  forM_ (zip [0..] tys) $ \(i, ty) -> do
+  forM_ (zip [0..] tys) \(i, ty) -> do
     ptr <- alloca 1 ty >>= castVoidPtr
     resultsPtrOffset <- gep resultsPtr $ i32Lit i
     store resultsPtrOffset ptr
@@ -629,7 +647,7 @@ makeMultiResultAlloc tys = do
 
 loadMultiResultAlloc :: [L.Type] -> Operand -> Compile [Operand]
 loadMultiResultAlloc tys ptr =
-  forM (zip [0..] tys) $ \(i, ty) ->
+  forM (zip [0..] tys) \(i, ty) ->
     gep ptr (i32Lit i) >>= load >>= castLPtr ty >>= load
 
 runMCKernel :: ExternFunSpec
@@ -765,7 +783,7 @@ scalarTy b = case b of
     Float64Type -> fp64
     Float32Type -> fp32
   Vector sb -> L.VectorType (fromIntegral vectorWidth) $ scalarTy $ Scalar sb
-  PtrType (_, s, t) -> L.PointerType (scalarTy t) (lAddress s)
+  PtrType (s, t) -> L.PointerType (scalarTy t) (lAddress s)
 
 hostPtrTy :: L.Type -> L.Type
 hostPtrTy ty = L.PointerType ty $ L.AddrSpace 0
@@ -798,7 +816,7 @@ asIntWidth :: Operand -> L.Type -> Compile Operand
 asIntWidth op ~expTy@(L.IntegerType expWidth) = case compare expWidth opWidth of
   LT -> emitInstr expTy $ L.Trunc op expTy []
   EQ -> return op
-  GT -> emitInstr expTy $ L.ZExt  op expTy []
+  GT -> emitInstr expTy $ L.SExt  op expTy []
   where ~(L.IntegerType opWidth) = L.typeOf op
 
 freshParamOpPair :: [L.ParameterAttribute] -> L.Type -> Compile (Parameter, Operand)
@@ -858,16 +876,40 @@ cpuBinaryIntrinsic op x y = case L.typeOf x of
     floatIntrinsic ty name = ExternFunSpec (L.mkName name) ty [] [] [ty, ty]
     callFloatIntrinsic ty name = emitExternCall (floatIntrinsic ty name) [x, y]
 
+-- === Output stream ===
+
+outputStreamPtrLName :: L.Name
+outputStreamPtrLName  = asLLVMName outputStreamPtrName
+
+outputStreamPtrDef :: L.Definition
+outputStreamPtrDef = L.GlobalDefinition $ L.globalVariableDefaults
+  { L.name = outputStreamPtrLName
+  , L.type' = hostVoidp
+  , L.linkage = L.Private
+  , L.initializer = Just $ C.Null hostVoidp }
+
+outputStreamPtr :: Operand
+outputStreamPtr = L.ConstantOperand $ C.GlobalReference
+ (hostPtrTy hostVoidp) outputStreamPtrLName
+
+initializeOutputStream :: Operand -> Compile ()
+initializeOutputStream streamFD = do
+  streamPtr <- emitExternCall fdopenFun [streamFD]
+  store outputStreamPtr streamPtr
+
+outputStreamEnv :: OperandEnv
+outputStreamEnv = outputStreamPtrName @> outputStreamPtr
+
 -- === Compile monad utilities ===
 
 runCompile :: Device -> Compile a -> a
 runCompile dev m = evalState (runReaderT m env) initState
   where
-    env = CompileEnv mempty dev
+    env = CompileEnv outputStreamEnv dev
     initState = CompileState [] [] [] "start_block" mempty mempty mempty
 
 extendOperands :: OperandEnv -> Compile a -> Compile a
-extendOperands openv = local $ \env -> env { operandEnv = (operandEnv env) <> openv }
+extendOperands openv = local \env -> env { operandEnv = (operandEnv env) <> openv }
 
 lookupImpVar :: IVar -> Compile Operand
 lookupImpVar v = asks ((! v) . operandEnv)
@@ -885,7 +927,7 @@ freshName :: Name -> Compile L.Name
 freshName v = do
   used <- gets usedNames
   let v' = genFresh v used
-  modify $ \s -> s { usedNames = used <> v' @> () }
+  modify \s -> s { usedNames = used <> v' @> () }
   return $ nameToLName v'
   where
     nameToLName :: Name -> L.Name
@@ -944,6 +986,9 @@ mallocFun = ExternFunSpec "malloc_dex" (hostPtrTy i8) [L.NoAlias] [] [i64]
 
 freeFun :: ExternFunSpec
 freeFun = ExternFunSpec "free_dex" L.VoidType [] [] [hostPtrTy i8]
+
+fdopenFun :: ExternFunSpec
+fdopenFun = ExternFunSpec "fdopen_w" (hostPtrTy i8) [L.NoAlias] [] [i32]
 
 boolTy :: L.Type
 boolTy = i8

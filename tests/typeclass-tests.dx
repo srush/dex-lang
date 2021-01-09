@@ -1,0 +1,43 @@
+
+
+interface InterfaceTest1 a
+  InterfaceTest1 : a
+> Error: variable already defined: InterfaceTest1
+
+interface InterfaceTest3 a
+  foo : a -> Int
+  foo : a -> Int
+> Error: variable already defined: foo
+
+interface InterfaceTest4 a
+  foo : Int
+  bar : a -> Int
+
+instance InterfaceTest4 Float
+  foo = 1
+  bar = \_. 1
+  foo = 1
+> Type error:Duplicate method: foo
+
+instance InterfaceTest4 Float
+  foo = 1
+> Type error:Missing method: bar
+
+instance InterfaceTest4 Float
+  baz = 1
+> Type error:baz is not a method of InterfaceTest4
+
+instance InterfaceTest4 Float
+  foo = 1
+  bar = \_. 'x'
+> Type error:
+> Expected: Int32
+>   Actual: Word8
+>
+>   bar = \_. 'x'
+>             ^^^
+
+instance InterfaceTest4 Float
+  foo = 1
+  bar = \_. 1
+

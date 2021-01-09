@@ -38,6 +38,10 @@ void free_dex(char* ptr) {
   free(ptr);
 }
 
+void* fdopen_w(int fd) {
+  return fdopen(fd, "w");
+}
+
 uint32_t rotate_left(uint32_t x, uint32_t d) {
   return (x << d) | (x >> (32 - d));
 }
@@ -144,9 +148,9 @@ double randunif(uint64_t keypair) {
   return out - 1;
 }
 
-void showHex(char **resultPtr, int x) {
+void showHex(char **resultPtr, char x) {
   auto p = reinterpret_cast<char*>(malloc_dex(100));  // TODO: something better!
-  auto n = sprintf(p, "%02x", x);
+  auto n = sprintf(p, "%02hhX", x);
   auto result1Ptr = reinterpret_cast<int32_t*>(resultPtr[0]);
   auto result2Ptr = reinterpret_cast<char**>(  resultPtr[1]);
   *result1Ptr = n;

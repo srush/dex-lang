@@ -1,0 +1,74 @@
+
+:p unsafeIO \().
+  withTempFile \fname.
+    withFile fname WriteMode \stream.
+      fwrite stream "lorem ipsum\n"
+      fwrite stream "dolor sit amet\n"
+    readFile fname
+> (AsList 27 "lorem ipsum
+> dolor sit amet
+> ")
+
+:p unsafeIO \().
+  withAlloc 4 \ptr:(Ptr Int).
+    for i:(Fin 4). store (ptr +>> ordinal i) (ordinal i)
+    tabFromPtr (Fin 4) ptr
+> [0, 1, 2, 3]
+
+unsafeIO \().
+  print "testing log"
+> testing log
+> ()
+
+unsafeIO \().
+  for i':(Fin 10).
+    i = ordinal i'
+    if rem i 2 == 0
+      then print $ show i <> " is even"
+      else print $ show i <> " is odd"
+> 0 is even
+> 1 is odd
+> 2 is even
+> 3 is odd
+> 4 is even
+> 5 is odd
+> 6 is even
+> 7 is odd
+> 8 is even
+> 9 is odd
+> [(), (), (), (), (), (), (), (), (), ()]
+
+:p storageSize Int
+> 4
+
+:p unsafeIO \().
+  withAlloc 1 \ptr:(Ptr Int).
+    store ptr 3
+    load ptr
+> 3
+
+:p unsafeIO \().
+  withDynamicBuffer \buf.
+    extendDynBuffer buf $ toList for i:(Fin 1000). ordinal i
+    extendDynBuffer buf $ toList for i:(Fin 1000). ordinal i
+    (AsList _ xs) = loadDynBuffer buf
+    sum xs
+> 999000
+
+:p unsafeIO \().
+  s = for i:(Fin 10000). IToW8 $ FToI $ 128.0 * rand (ixkey (newKey 0) i)
+  withTempFile \fname.
+    withFile fname WriteMode \stream.
+      fwrite stream $ AsList _ s
+    (AsList _ s') = readFile fname
+    sum (for i. W8ToI s.i) == sum (for i. W8ToI s'.i)
+> True
+
+:p unsafeIO do getEnv "NOT_AN_ENV_VAR"
+> Nothing
+
+:p unsafeIO do getEnv "DEX_TEST_MODE"
+> (Just (AsList 1 "t"))
+
+:p dex_test_mode ()
+> True

@@ -12,25 +12,33 @@ To learn more, check out our
 or these example programs:
 
   * [Dex prelude](https://google-research.github.io/dex-lang/prelude.html)
-  * [Mandelbrot set](https://google-research.github.io/dex-lang/mandelbrot.html)
-  * [Ray tracer](https://google-research.github.io/dex-lang/raytrace.html)
-  * [Estimating pi](https://google-research.github.io/dex-lang/pi.html)
-  * [Hamiltonian Monte Carlo](https://google-research.github.io/dex-lang/mcmc.html)
-  * [ODE integrator](https://google-research.github.io/dex-lang/ode-integrator.html)
-  * [Sierpinski triangle](https://google-research.github.io/dex-lang/sierpinski.html)
-  * [Basis function regression](https://google-research.github.io/dex-lang/regression.html)
-  * [Brownian bridge](https://google-research.github.io/dex-lang/brownian_motion.html)
+  * [Mandelbrot set](https://google-research.github.io/dex-lang/examples/mandelbrot.html)
+  * [Ray tracer](https://google-research.github.io/dex-lang/examples/raytrace.html)
+  * [Estimating pi](https://google-research.github.io/dex-lang/examples/pi.html)
+  * [Hamiltonian Monte Carlo](https://google-research.github.io/dex-lang/examples/mcmc.html)
+  * [ODE integrator](https://google-research.github.io/dex-lang/oexamples/de-integrator.html)
+  * [Sierpinski triangle](https://google-research.github.io/dex-lang/examples/sierpinski.html)
+  * [Basis function regression](https://google-research.github.io/dex-lang/examples/regression.html)
+  * [Brownian bridge](https://google-research.github.io/dex-lang/examples/brownian_motion.html)
 
-Please note that Dex is an experimental research project at an early stage of
-development. Contributions welcome!
+🚨 **Dex is an experimental research project at an early stage of
+development. Expect monstrous bugs and razor-sharp edges!**
+
+🤝 **Contributions welcome!** See our issue tracker for [good first issues](https://github.com/google-research/dex-lang/labels/good%20first%20issue), or browse by [thematic labels](https://github.com/google-research/dex-lang/labels).
 
 ## Dependencies
 
   * Install [stack](https://www.haskellstack.org)
   * Install LLVM 9
-    * `apt-get install llvm-9-dev` on Ubuntu/Debian,
-    * `brew install llvm@9` on macOS, and ensure it is on your `PATH` e.g. via `export PATH="$(brew --prefix llvm@9)/bin:$PATH"` before building.
-  * Install libpng (often included by default in *nix)
+    * Ubuntu/Debian: `apt-get install llvm-9-dev`
+    * macOS: `brew install llvm@9`
+      * Make sure `llvm@9` is on your `PATH` before building. Example: `export PATH="$(brew --prefix llvm@9)/bin:$PATH"`
+  * Install clang (may be installed together with llvm)
+    * Ubuntu/Debian: `apt-get install clang`
+    * macOS: installs with llvm
+  * Install libpng (often included by default in *nix platforms)
+    * Ubuntu/Debian: `apt-get install libpng-dev`
+    * macOS: `brew install libpng`
 
 ## Building
 

@@ -80,10 +80,10 @@ toImpModule :: TopEnv -> Backend -> CallingConvention -> Name
             -> (ImpFunction, ImpModule, AtomRecon)
 toImpModule env backend cc entryName argBinders maybeDest block = do
   let standaloneFunctions =
-        for (requiredFunctions env block) $ \(v, f) ->
+        for (requiredFunctions env block) \(v, f) ->
           runImpM initCtx inVarScope $ toImpStandalone v f
   runImpM initCtx inVarScope $ do
-    (reconAtom, impBlock) <- scopedBlock $ translateTopLevel (maybeDest, block)
+    (reconAtom, impBlock) <- scopedBlock $ translateTopLevel env (maybeDest, block)
     otherFunctions <- toList <$> looks envFunctions
     let ty = IFunType cc (map binderAnn argBinders) (impBlockType impBlock)
     let mainFunction = ImpFunction (entryName:>ty) argBinders impBlock
@@ -98,9 +98,13 @@ toImpModule env backend cc entryName argBinders maybeDest block = do
 
 requiredFunctions :: HasVars a => Scope -> a -> [(Name, Atom)]
 requiredFunctions scope expr =
-  for (transitiveClosure getParents immediateParents) $ \fname -> do
-    let (_, LetBound _ (Atom f)) = scope ! fname
-    (fname, f)
+  flip foldMap (transitiveClosure getParents immediateParents) \fname ->
+    case scope ! fname of
+       (_, LetBound _ (Atom f)) -> [(fname, f)]
+       -- we treat runtime-supplied global constants (e.g. the virtual stdout
+       -- channel) as lambda-bound. TODO: consider a new annotation.
+       (_, LamBound _) -> []
+       _ -> error "Shouldn't have other free variables left"
   where
     getParents :: Name -> [Name]
     getParents fname = envNames $ freeVars $ scope ! fname
@@ -110,14 +114,15 @@ requiredFunctions scope expr =
 
 -- We don't emit any results when a destination is provided, since they are already
 -- going to be available through the dest.
-translateTopLevel :: WithDest Block -> ImpM (AtomRecon, [IExpr])
-translateTopLevel (maybeDest, block) = do
+translateTopLevel :: TopEnv -> WithDest Block -> ImpM (AtomRecon, [IExpr])
+translateTopLevel topEnv (maybeDest, block) = do
   outDest <- case maybeDest of
         Nothing   -> makeAllocDest Unmanaged $ getType block
         Just dest -> return dest
   handleErrors $ void $ translateBlock mempty (Just outDest, block)
   resultAtom <- destToAtom outDest
-  let vsOut = envAsVars $ freeVars resultAtom
+  -- Some names in topEnv refer to global constants, like the virtual stdout channel
+  let vsOut = envAsVars $ freeVars resultAtom `envDiff` topEnv
   let reconAtom = Abs (toNest $ [Bind (v:>ty) | (v:>(ty, _)) <- vsOut]) resultAtom
   let resultIExprs = case maybeDest of
         Nothing -> [IVar (v:>fromScalarType ty) | (v:>(ty, _)) <- vsOut]
@@ -140,7 +145,7 @@ toImpStandalone fname ~(LamVal b body) = do
   impBlock <- scopedErrBlock $ do
     arg <- destToAtom argDest
     void $ translateBlock (b@>arg) (Just outDest, body)
-  let bs = for ptrSizes $ \(Bind (v:>BaseTy ty), _) -> Bind $ v:>ty
+  let bs = for ptrSizes \(Bind (v:>BaseTy ty), _) -> Bind $ v:>ty
   let fTy = IFunType CEntryFun (map binderAnn bs) (impBlockType impBlock)
   return $ ImpFunction (fname:>fTy) bs impBlock
 
@@ -148,7 +153,7 @@ translateBlock :: SubstEnv -> WithDest Block -> ImpM Atom
 translateBlock env destBlock = do
   let (decls, result, copies) = splitDest destBlock
   env' <- (env<>) <$> catFoldM translateDecl env decls
-  forM_ copies $ \(dest, atom) -> copyAtom dest =<< impSubst env' atom
+  forM_ copies \(dest, atom) -> copyAtom dest =<< impSubst env' atom
   translateExpr env' result
 
 translateDecl :: SubstEnv -> WithDest Decl -> ImpM SubstEnv
@@ -237,7 +242,7 @@ toImpOp :: WithDest (PrimOp Atom) -> ImpM Atom
 toImpOp (maybeDest, op) = case op of
   TabCon (TabTy b _) rows -> do
     dest <- allocDest maybeDest resultTy
-    forM_ (zip [0..] rows) $ \(i, row) -> do
+    forM_ (zip [0..] rows) \(i, row) -> do
       ithDest <- destGet dest =<< intToIndex (binderType b) (IIdxRepVal i)
       copyAtom ithDest row
     destToAtom dest
@@ -271,14 +276,20 @@ toImpOp (maybeDest, op) = case op of
   IndexRef refDest i -> returnVal =<< destGet refDest i
   FstRef ~(Con (ConRef (PairCon ref _  ))) -> returnVal ref
   SndRef ~(Con (ConRef (PairCon _   ref))) -> returnVal ref
+  IOAlloc ty n -> do
+    ptr <- emitAlloc (Heap CPU, ty) (fromScalarAtom n)
+    returnVal $ toScalarAtom ptr
+  IOFree ptr -> do
+    emitStatement $ Free $ fromScalarAtom ptr
+    return UnitVal
+  PtrOffset arr (IdxRepVal 0) -> returnVal arr
   PtrOffset arr off -> do
     buf <- impOffset (fromScalarAtom arr) (fromScalarAtom off)
     returnVal $ toScalarAtom buf
   PtrLoad arr -> returnVal . toScalarAtom =<< loadAnywhere (fromScalarAtom arr)
-  GetPtr tab -> do
-    (dest, ptr) <- makeAllocDestForPtr (getType tab)
-    copyAtom dest tab
-    returnVal ptr
+  PtrStore ptr x -> do
+    store (fromScalarAtom ptr) (fromScalarAtom x)
+    return UnitVal
   SliceOffset ~(Con (IndexSliceVal n _ tileOffset)) idx -> do
     i' <- indexToInt idx
     i <- iaddI (fromScalarAtom tileOffset) i'
@@ -351,7 +362,7 @@ toImpHof env (maybeDest, hof) = do
                                             Select (toScalarAtom isLast)
                                                    (toScalarAtom elemsUntilEnd)
                                                    (toScalarAtom usualChunkSize))
-              emitLoop "li" Fwd (fromScalarAtom threadChunkSize) $ \li -> do
+              emitLoop "li" Fwd (fromScalarAtom threadChunkSize) \li -> do
                 i <- li `iaddI` chunkStart
                 let idx = Con $ ParIndexCon idxTy $ toScalarAtom i
                 ithDest <- destGet dest idx
@@ -362,19 +373,19 @@ toImpHof env (maybeDest, hof) = do
               cond <- liftM snd $ scopedBlock $ do
                 i <- destToAtom iPtr
                 inRange <- (fromScalarAtom i) `iltI` n
+                emitWhen inRange $ do
+                  let idx = Con $ ParIndexCon idxTy i
+                  ithDest <- destGet dest idx
+                  void $ translateBlock (env <> b @> idx) (Just ithDest, body)
+                  copyAtom iPtr . toScalarAtom =<< iaddI (fromScalarAtom i)
+                                                     (fromScalarAtom numThreads)
                 return ((), [inRange])
-              wbody <- scopedErrBlock $ do
-                i <- destToAtom iPtr
-                let idx = Con $ ParIndexCon idxTy i
-                ithDest <- destGet dest idx
-                void $ translateBlock (env <> b @> idx) (Just ithDest, body)
-                copyAtom iPtr . toScalarAtom =<< iaddI (fromScalarAtom i) (fromScalarAtom numThreads)
-              emitStatement $ IWhile cond wbody
+              emitStatement $ IWhile cond
           destToAtom dest
         _ -> do
           n <- indexSetSize idxTy
           dest <- allocDest maybeDest resultTy
-          emitLoop (binderNameHint b) d n $ \i -> do
+          emitLoop (binderNameHint b) d n \i -> do
             idx <- intToIndex idxTy i
             ithDest <- destGet dest idx
             void $ translateBlock (env <> b @> idx) (Just ithDest, body)
@@ -382,13 +393,13 @@ toImpHof env (maybeDest, hof) = do
     For ParallelFor ~fbody@(LamVal b _) -> do
       idxTy <- impSubst env $ binderType b
       dest <- allocDest maybeDest resultTy
-      buildKernel idxTy $ \LaunchInfo{..} buildBody -> do
-        liftM (,()) $ buildBody $ \ThreadInfo{..} -> do
+      buildKernel idxTy \LaunchInfo{..} buildBody -> do
+        liftM (,()) $ buildBody \ThreadInfo{..} -> do
           let threadBody = fst $ flip runSubstEmbed (freeVars fbody) $
-                buildLam (Bind $ "hwidx" :> threadRange) PureArrow $ \hwidx ->
+                buildLam (Bind $ "hwidx" :> threadRange) PureArrow \hwidx ->
                   appReduce fbody =<< (emitOp $ Inject hwidx)
           let threadDest = Con $ TabRef $ fst $ flip runSubstEmbed (freeVars dest) $
-                buildLam (Bind $ "hwidx" :> threadRange) TabArrow $ \hwidx ->
+                buildLam (Bind $ "hwidx" :> threadRange) TabArrow \hwidx ->
                   indexDest dest =<< (emitOp $ Inject hwidx)
           void $ toImpHof env (Just threadDest, For (RegularFor Fwd) threadBody)
       destToAtom dest
@@ -400,12 +411,12 @@ toImpHof env (maybeDest, hof) = do
       nTiles      <- n `idivI` tileLen
       epilogueOff <- nTiles `imulI` tileLen
       nEpilogue   <- n `isubI` epilogueOff
-      emitLoop (binderNameHint tb) Fwd nTiles $ \iTile -> do
+      emitLoop (binderNameHint tb) Fwd nTiles \iTile -> do
         tileOffset <- toScalarAtom <$> iTile `imulI` tileLen
         let tileAtom = Con $ IndexSliceVal idxTy tileIdxTy tileOffset
         tileDest <- fromEmbed $ sliceDestDim d dest tileOffset tileIdxTy
         void $ translateBlock (env <> tb @> tileAtom) (Just tileDest, tBody)
-      emitLoop (binderNameHint sb) Fwd nEpilogue $ \iEpi -> do
+      emitLoop (binderNameHint sb) Fwd nEpilogue \iEpi -> do
         i <- iEpi `iaddI` epilogueOff
         idx <- intToIndex idxTy i
         sDest <- fromEmbed $ indexDestDim d dest idx
@@ -415,16 +426,16 @@ toImpHof env (maybeDest, hof) = do
       idxTy <- impSubst env idxTy'
       (mappingDest, finalAccDest) <- destPairUnpack <$> allocDest maybeDest resultTy
       let PairTy _ accType = resultTy
-      (numTileWorkgroups, wgResArr, widIdxTy) <- buildKernel idxTy $ \LaunchInfo{..} buildBody -> do
+      (numTileWorkgroups, wgResArr, widIdxTy) <- buildKernel idxTy \LaunchInfo{..} buildBody -> do
         let widIdxTy = Fin $ toScalarAtom numWorkgroups
         let tidIdxTy = Fin $ toScalarAtom workgroupSize
         wgResArr  <- alloc $ TabTy (Ignore widIdxTy) accType
         thrAccArr <- alloc $ TabTy (Ignore widIdxTy) $ TabTy (Ignore tidIdxTy) accType
-        mappingKernelBody <- buildBody $ \ThreadInfo{..} -> do
+        mappingKernelBody <- buildBody \ThreadInfo{..} -> do
           let TC (ParIndexRange _ gtid nthr) = threadRange
           let scope = freeVars mappingDest
           let tileDest = Con $ TabRef $ fst $ flip runSubstEmbed scope $ do
-                buildLam (Bind $ "hwidx":>threadRange) TabArrow $ \hwidx -> do
+                buildLam (Bind $ "hwidx":>threadRange) TabArrow \hwidx -> do
                   indexDest mappingDest =<< (emitOp $ Inject hwidx)
           wgAccs <- destGet thrAccArr =<< intToIndex widIdxTy wid
           thrAcc <- destGet wgAccs    =<< intToIndex tidIdxTy tid
@@ -436,12 +447,12 @@ toImpHof env (maybeDest, hof) = do
       -- TODO: Skip the reduction kernel if unnecessary?
       -- TODO: Reduce sequentially in the CPU backend?
       -- TODO: Actually we only need the previous-power-of-2 many threads
-      buildKernel widIdxTy $ \LaunchInfo{..} buildBody -> do
+      buildKernel widIdxTy \LaunchInfo{..} buildBody -> do
         -- We only do a one-level reduciton in the workgroup, so it is correct
         -- only if the end up scheduling a single workgroup.
         moreThanOneGroup <- (IIdxRepVal 1) `iltI` numWorkgroups
         guardBlock moreThanOneGroup $ emitStatement IThrowError
-        redKernelBody <- buildBody $ \ThreadInfo{..} ->
+        redKernelBody <- buildBody \ThreadInfo{..} ->
           workgroupReduce tid finalAccDest wgResArr numTileWorkgroups
         return (redKernelBody, ())
       PairVal <$> destToAtom mappingDest <*> destToAtom finalAccDest
@@ -455,20 +466,21 @@ toImpHof env (maybeDest, hof) = do
           let arrIdxTy = binderType arrIdxB
           offPtr <- alloc IdxRepTy
           copyAtom offPtr $ toScalarAtom elemCountDown2
+          let wbody = do
+                off       <- fromScalarAtom <$> destToAtom offPtr
+                loadIdx   <- iaddI tid off
+                shouldAdd <- bindM2 bandI (tid `iltI` off) (loadIdx `iltI` elemCount)
+                guardBlock shouldAdd $ do
+                  threadDest <- destGet arrDest =<< intToIndex arrIdxTy tid
+                  addToAtom threadDest =<< destToAtom =<< destGet arrDest =<< intToIndex arrIdxTy loadIdx
+                emitStatement ISyncWorkgroup
+                copyAtom offPtr . toScalarAtom =<< off `idivI` (IIdxRepVal 2)
           cond <- liftM snd $ scopedBlock $ do
             off  <- fromScalarAtom <$> destToAtom offPtr
             cond <- emitInstr $ IPrimOp $ ScalarBinOp (ICmp Greater) off (IIdxRepVal 0)
+            emitWhen cond wbody
             return ((), [cond])
-          wbody <- scopedErrBlock $ do
-            off       <- fromScalarAtom <$> destToAtom offPtr
-            loadIdx   <- iaddI tid off
-            shouldAdd <- bindM2 bandI (tid `iltI` off) (loadIdx `iltI` elemCount)
-            guardBlock shouldAdd $ do
-              threadDest <- destGet arrDest =<< intToIndex arrIdxTy tid
-              addToAtom threadDest =<< destToAtom =<< destGet arrDest =<< intToIndex arrIdxTy loadIdx
-            emitStatement ISyncWorkgroup
-            copyAtom offPtr . toScalarAtom =<< off `idivI` (IIdxRepVal 2)
-          emitStatement $ IWhile cond wbody
+          emitStatement $ IWhile cond
           firstThread <- tid `iltI` (IIdxRepVal 1)
           guardBlock firstThread $
             copyAtom resDest =<< destToAtom =<< destGet arrDest =<< intToIndex arrIdxTy tid
@@ -480,17 +492,15 @@ toImpHof env (maybeDest, hof) = do
           let getNext = imulI (IIdxRepVal 2) . fromScalarAtom =<< destToAtom rPtr
           cond <- liftM snd $ scopedBlock $ do
             canGrow <- getNext >>= (`iltI` x)
+            emitWhen canGrow $ copyAtom rPtr . toScalarAtom =<< getNext
             return ((), [canGrow])
-          wbody <- scopedErrBlock $ do
-            copyAtom rPtr . toScalarAtom =<< getNext
-          emitStatement $ IWhile cond wbody
+          emitStatement $ IWhile cond
           fromScalarAtom <$> destToAtom rPtr
-    While ~(Lam (Abs _ (_, cond))) ~(Lam (Abs _ (_, body))) -> do
-      cond' <- liftM snd $ scopedBlock $ do
-                 ans <- translateBlock env (Nothing, cond)
+    While ~(Lam (Abs _ (_, body))) -> do
+      body' <- liftM snd $ scopedBlock $ do
+                 ans <- translateBlock env (Nothing, body)
                  return ((), [fromScalarAtom ans])
-      body' <- scopedErrBlock $ void $ translateBlock env (Nothing, body)
-      emitStatement $ IWhile cond' body'
+      emitStatement $ IWhile body'
       return UnitVal
     RunReader r ~(BinaryFunVal _ ref _ body) -> do
       rDest <- alloc $ getType r
@@ -507,8 +517,11 @@ toImpHof env (maybeDest, hof) = do
       copyAtom sDest =<< impSubst env s
       void $ translateBlock (env <> ref @> sDest) (Just aDest, body)
       PairVal <$> destToAtom aDest <*> destToAtom sDest
+    RunIO ~(Lam (Abs _ (_, body))) ->
+      translateBlock env (maybeDest, body)
     Linearize _ -> error "Unexpected Linearize"
     Transpose _ -> error "Unexpected Transpose"
+    CatchException _ -> error "Unexpected CatchException"
 
 data LaunchInfo = LaunchInfo { numWorkgroups :: IExpr, workgroupSize :: IExpr }
 data ThreadInfo = ThreadInfo { tid :: IExpr, wid :: IExpr, threadRange :: Type }
@@ -539,7 +552,7 @@ buildKernel idxTy f = do
         LLVMCUDA -> (CUDAKernelLaunch, GPU)
         LLVMMC   -> (MCThreadLaunch  , CPU)
         backend  -> error $ "Shouldn't be launching kernels from " ++ show backend
-  ((kernelBody, aux), env) <- scoped $ f LaunchInfo{..} $ \mkBody ->
+  ((kernelBody, aux), env) <- scoped $ f LaunchInfo{..} \mkBody ->
     withDevice dev $ withLevel ThreadLevel $ scopedErrBlock $ do
       gtid <- iaddI tid =<< imulI wid wsz
       let threadRange = TC $ ParIndexRange idxTy (toScalarAtom gtid) (toScalarAtom nthr)
@@ -572,7 +585,7 @@ type DestM = ReaderT DestEnv (CatT (Env (Type, Block)) Embed)
 makeDest :: AllocInfo -> Type -> Embed ([(Binder, Atom)], Dest)
 makeDest allocInfo ty = do
   (dest, ptrs) <- flip runCatT mempty $ flip runReaderT env $ makeDestRec ty
-  ptrs' <- forM (envPairs ptrs) $ \(v, (ptrTy, numel)) -> do
+  ptrs' <- forM (envPairs ptrs) \(v, (ptrTy, numel)) -> do
     numel' <- emitBlock numel
     return (Bind (v:>ptrTy), numel')
   return (ptrs', dest)
@@ -589,7 +602,7 @@ makeDestRec ty = case ty of
                           makeDestRec ty
         makeBoxes (envPairs ptrs) dest
       else do
-        lam <- buildLam (Bind ("i":> binderAnn b)) TabArrow $ \(Var i) -> do
+        lam <- buildLam (Bind ("i":> binderAnn b)) TabArrow \(Var i) -> do
           bodyTy' <- substEmbed (b@>Var i) bodyTy
           withEnclosingIdxs (Bind i) $ makeDestRec bodyTy'
         return $ Con $ TabRef lam
@@ -605,7 +618,7 @@ makeDestRec ty = case ty of
           "Dependent data constructors only allowed for single-constructor types"
         tag <- rec TagRepTy
         let dcs' = applyDataDefParams def params
-        contents <- forM dcs' $ \(DataConDef _ bs) -> forM (toList bs) (rec . binderType)
+        contents <- forM dcs' \(DataConDef _ bs) -> forM (toList bs) (rec . binderType)
         return $ Con $ ConRef $ SumAsProd ty tag contents
   RecordTy (NoExt types) -> (Con . RecordRef) <$> forM types rec
   VariantTy (NoExt types) -> do
@@ -641,7 +654,7 @@ makeBaseTypePtr ty = do
   -- where they could cast shadows
   let addrSpace = chooseAddrSpace allocInfo numel
   let ptrName = genFresh (Name AllocPtrName "ptr" 0) (scope <> ptrScope)
-  let ptrTy = PtrTy (AllocatedPtr, addrSpace, ty)
+  let ptrTy = PtrTy (addrSpace, ty)
   extend (ptrName @> (ptrTy, numel))
   let ptr = Var (ptrName :> ptrTy)
   applyIdxs ptr idxs
@@ -680,6 +693,11 @@ copyAtom (Con dest) src = case (dest, src) of
   (ConRef (SumAsProd _ tag payload), DataCon _ _ con x) -> do
     copyAtom tag (TagRepVal $ fromIntegral con)
     zipWithM_ copyAtom (payload !! con) x
+  (ConRef (SumAsProd _ tagDest payloadDest), Con (SumAsProd _ tag payload)) -> do
+    copyAtom tagDest tag
+    unless (all null payload) $ -- optimization
+      emitSwitch (fromScalarAtom tag) $
+        zipWith (zipWithM_ copyAtom) payloadDest payload
   (ConRef destCon, Con srcCon) -> zipWithRefConM copyAtom destCon srcCon
   (RecordRef refs, Record vals)
     | fmap (const ()) refs == fmap (const ()) vals -> do
@@ -703,15 +721,15 @@ copyDataConArgs bindings args =
 
 loadDest :: MonadEmbed m => Dest -> m Atom
 loadDest (BoxedRef b ptrPtr _ body) = do
-  ptr <- ptrLoad ptrPtr
+  ptr <- unsafePtrLoad ptrPtr
   body' <- substEmbed (b@>ptr) body
   loadDest body'
 loadDest (DataConRef def params bs) = do
   DataCon def params 0 <$> loadDataConArgs bs
 loadDest (Con dest) = do
  case dest of
-  BaseTypeRef ptr -> ptrLoad ptr
-  TabRef (TabVal b body) -> buildLam b TabArrow $ \i -> do
+  BaseTypeRef ptr -> unsafePtrLoad ptr
+  TabRef (TabVal b body) -> buildLam b TabArrow \i -> do
     body' <- substEmbed (b@>i) body
     result <- emitBlock body'
     loadDest result
@@ -735,7 +753,7 @@ loadDataConArgs (Nest (DataConRefBinding b ref) rest) = do
 
 indexDestDim :: MonadEmbed m => Int->Dest -> Atom -> m Dest
 indexDestDim 0 dest i = indexDest dest i
-indexDestDim d dest i = buildFor Fwd (Bind ("i":>idxTy)) $ \j -> do
+indexDestDim d dest i = buildFor Fwd (Bind ("i":>idxTy)) \j -> do
   dest' <- indexDest dest j
   indexDestDim (d-1) dest' i
   where
@@ -748,7 +766,7 @@ indexDest dest _ = error $ pprint dest
 
 sliceDestDim :: MonadEmbed m => Int -> Dest -> Atom -> Type -> m Dest
 sliceDestDim 0 dest i sliceIdxTy = sliceDest dest i sliceIdxTy
-sliceDestDim d dest i sliceIdxTy = buildFor Fwd (Bind ("i":>idxTy)) $ \j -> do
+sliceDestDim d dest i sliceIdxTy = buildFor Fwd (Bind ("i":>idxTy)) \j -> do
   dest' <- indexDest dest j
   sliceDestDim (d-1) dest' i sliceIdxTy
   where
@@ -757,7 +775,7 @@ sliceDestDim d dest i sliceIdxTy = buildFor Fwd (Bind ("i":>idxTy)) $ \j -> do
 
 sliceDest :: MonadEmbed m => Dest -> Atom -> Type -> m Dest
 sliceDest ~(Con (TabRef tab@(TabVal b _))) i sliceIdxTy = (Con . TabRef) <$> do
-  buildFor Fwd (Bind ("j" :> sliceIdxTy)) $ \j -> do
+  buildFor Fwd (Bind ("j" :> sliceIdxTy)) \j -> do
     j' <- indexToIntE j
     ioff <- iadd j' i
     vidx <- intToIndexE (binderType b) ioff
@@ -781,25 +799,14 @@ makeAllocDestWithPtrs allocTy ty = do
   backend <- asks impBackend
   curDev <- asks curDevice
   (ptrsSizes, dest) <- fromEmbed $ makeDest (backend, curDev, allocTy) ty
-  (env, ptrs) <- flip foldMapM ptrsSizes $ \(Bind (ptr:>PtrTy ptrTy), size) -> do
+  (env, ptrs) <- flip foldMapM ptrsSizes \(Bind (ptr:>PtrTy ptrTy), size) -> do
     ptr' <- emitAlloc ptrTy $ fromScalarAtom size
     case ptrTy of
-      (_, Heap _, _) | allocTy == Managed -> extendAlloc ptr'
+      (Heap _, _) | allocTy == Managed -> extendAlloc ptr'
       _ -> return ()
     return (ptr @> toScalarAtom ptr', [ptr'])
   dest' <- impSubst env dest
   return (dest', ptrs)
-
--- TODO: deallocation!
-makeAllocDestForPtr :: Type -> ImpM (Dest, Atom)
-makeAllocDestForPtr ty = do
-  (ptrSizes, dest) <- fromEmbed $ makeDest (LLVM, CPU, Unmanaged) ty
-  case ptrSizes of
-    [(Bind (ptr:>PtrTy ptrTy), size)] -> do
-      ptr' <- emitAlloc ptrTy $ fromScalarAtom size
-      dest' <- impSubst (ptr @> toScalarAtom ptr') dest
-      return (dest', toScalarAtom ptr')
-    _ -> error $ "expected a single pointer"
 
 splitDest :: WithDest Block -> ([WithDest Decl], WithDest Expr, [(Dest, Atom)])
 splitDest (maybeDest, (Block decls ans)) = do
@@ -813,7 +820,7 @@ splitDest (maybeDest, (Block decls ans)) = do
       let closureCopies = fmap (\(n, (d, t)) -> (d, Var $ n :> t))
                                (envPairs $ varDests `envDiff` foldMap letBoundVars decls)
 
-      let destDecls = flip fmap (toList decls) $ \d -> case d of
+      let destDecls = flip fmap (toList decls) \d -> case d of
                         Let _ b _  -> (fst <$> varDests `envLookup` b, d)
       (destDecls, (Nothing, ans), gatherCopies ++ closureCopies)
     _ -> (fmap (Nothing,) $ toList decls, (maybeDest, ans), [])
@@ -831,12 +838,13 @@ splitDest (maybeDest, (Block decls ans)) = do
       (_, Con (Lit _)) -> tell [(dest, result)]
       -- This is conservative, in case the type is dependent. We could do better.
       (DataConRef _ _ _, DataCon _ _ _ _) -> tell [(dest, result)]
+      -- This is conservative. Without it, we hit bugs like #348
+      (Con (ConRef (SumAsProd _ _ _)), _) -> tell [(dest, result)]
       (Con (ConRef destCon), Con srcCon) ->
         zipWithRefConM gatherVarDests destCon srcCon
       (Con (RecordRef items), Record items')
         | fmap (const ()) items == fmap (const ()) items' -> do
             zipWithM_ gatherVarDests (toList items) (toList items')
-      (Con (ConRef (SumAsProd _ _ _)), _) -> tell [(dest, result)]  -- TODO
       (_, ProjectElt _ _) -> tell [(dest, result)]  -- TODO: is this reasonable?
       _ -> unreachable
       where
@@ -865,10 +873,10 @@ chooseAddrSpace (backend, curDev, allocTy) numel = case allocTy of
                                                   else Heap mainDev
           | otherwise -> Heap mainDev
   where mainDev = case backend of
-          LLVM     -> CPU
-          LLVMMC   -> CPU
-          LLVMCUDA -> GPU
-          Interp   -> error "Shouldn't be compiling with interpreter backend"
+          LLVM      -> CPU
+          LLVMMC    -> CPU
+          LLVMCUDA  -> GPU
+          Interpreter -> error "Shouldn't be compiling with interpreter backend"
 
 isSmall :: Block -> Bool
 isSmall numel = case numel of
@@ -883,7 +891,7 @@ isSmall numel = case numel of
 
 allocateBuffer :: AddressSpace -> Bool -> BaseType -> IExpr -> ImpM IExpr
 allocateBuffer addrSpace mustFree b numel = do
-  buffer <- emitAlloc (AllocatedPtr, addrSpace, b) numel
+  buffer <- emitAlloc (addrSpace, b) numel
   when mustFree $ extendAlloc buffer
   return buffer
 
@@ -910,7 +918,7 @@ toScalarAtom ie = case ie of
   ILit l -> Con $ Lit l
   IVar (v:>b) -> Var (v:>BaseTy b)
 
-fromScalarType :: Type -> IType
+fromScalarType :: HasCallStack => Type -> IType
 fromScalarType (BaseTy b) =  b
 fromScalarType ty = error $ "Not a scalar type: " ++ pprint ty
 
@@ -941,7 +949,7 @@ zipTabDestAtom f ~dest@(Con (TabRef (TabVal b _))) ~src@(TabVal b' _) = do
     error $ "Mismatched dimensions: " <> pprint b <> " != " <> pprint b'
   let idxTy = binderType b
   n <- indexSetSize idxTy
-  emitLoop "i" Fwd n $ \i -> do
+  emitLoop "i" Fwd n \i -> do
     idx <- intToIndex idxTy i
     destIndexed <- destGet dest idx
     srcIndexed  <- translateExpr mempty (Nothing, App src idx)
@@ -951,8 +959,6 @@ zipWithRefConM :: Monad m => (Dest -> Atom -> m ()) -> Con -> Con -> m ()
 zipWithRefConM f destCon srcCon = case (destCon, srcCon) of
   (PairCon d1 d2, PairCon s1 s2) -> f d1 s1 >> f d2 s2
   (UnitCon, UnitCon) -> return ()
-  (SumAsProd _ tagRef xssRef, SumAsProd _ tag xss) ->
-    f tagRef tag >> zipWithM_ (zipWithM f) xssRef xss
   (IntRangeVal     _ _ iRef, IntRangeVal     _ _ i) -> f iRef i
   (IndexRangeVal _ _ _ iRef, IndexRangeVal _ _ _ i) -> f iRef i
   _ -> error $ "Unexpected ref/val " ++ pprint (destCon, srcCon)
@@ -971,6 +977,10 @@ addToAtom dest src = case (dest, src) of
     updated <- emitInstr $ IPrimOp $ op FAdd cur x'
     storeAnywhere ptr' updated
   (Con (TabRef _), TabVal _ _) -> zipTabDestAtom addToAtom dest src
+  (Con (ConRef (SumAsProd _ _ payloadDest)), Con (SumAsProd _ tag payload)) -> do
+    unless (all null payload) $ -- optimization
+      emitSwitch (fromScalarAtom tag) $
+        zipWith (zipWithM_ addToAtom) payloadDest payload
   (Con (ConRef destCon), Con srcCon) -> zipWithRefConM addToAtom destCon srcCon
   (Con (RecordRef dests), Record srcs) ->
     zipWithM_ addToAtom (toList dests) (toList srcs)
@@ -979,7 +989,7 @@ addToAtom dest src = case (dest, src) of
 loadAnywhere :: IExpr -> ImpM IExpr
 loadAnywhere ptr = do
   curDev <- asks curDevice
-  let (PtrType (_, addrSpace, ty)) = getIType ptr
+  let (PtrType (addrSpace, ty)) = getIType ptr
   case addrSpace of
     Heap ptrDev | ptrDev /= curDev -> do
       localPtr <- allocateStackSingleton ty
@@ -990,7 +1000,7 @@ loadAnywhere ptr = do
 storeAnywhere :: IExpr -> IExpr -> ImpM ()
 storeAnywhere ptr val = do
   curDev <- asks curDevice
-  let (PtrType (_, addrSpace, ty)) = getIType ptr
+  let (PtrType (addrSpace, ty)) = getIType ptr
   case addrSpace of
     Heap ptrDev | ptrDev /= curDev -> do
       localPtr <- allocateStackSingleton ty
@@ -1049,6 +1059,9 @@ alloc ty = makeAllocDest Managed ty
 handleErrors :: ImpM () -> ImpM ()
 handleErrors m = m `catchError` (const $ emitStatement IThrowError)
 
+emitWhen :: IExpr -> ImpM () -> ImpM ()
+emitWhen cond doIfTrue = emitSwitch cond [return (), doIfTrue]
+
 -- TODO: Consider targeting LLVM's `switch` instead of chained conditionals.
 emitSwitch :: IExpr -> [ImpM ()] -> ImpM ()
 emitSwitch testIdx = rec 0
@@ -1093,7 +1106,7 @@ restructureScalarOrPairTypeRec ty _ = error $ "Not a scalar or pair: " ++ pprint
 
 emitMultiReturnInstr :: ImpInstr -> ImpM [IExpr]
 emitMultiReturnInstr instr = do
-  vs <- forM (impInstrTypes instr) $ \ty -> freshVar ("v":>ty)
+  vs <- forM (impInstrTypes instr) \ty -> freshVar ("v":>ty)
   emitImpDecl $ ImpLet (map Bind vs) instr
   return (map IVar vs)
 
@@ -1117,7 +1130,7 @@ extendAlloc :: IExpr -> ImpM ()
 extendAlloc v = extend $ mempty { envPtrsToFree = [v] }
 
 emitAlloc :: HasCallStack => PtrType -> IExpr -> ImpM IExpr
-emitAlloc (_, addr, ty) n = emitInstr $ Alloc addr ty n
+emitAlloc (addr, ty) n = emitInstr $ Alloc addr ty n
 
 scopedErrBlock :: ImpM () -> ImpM ImpBlock
 scopedErrBlock body = liftM snd $ scopedBlock $ handleErrors body $> ((),[])
@@ -1167,6 +1180,7 @@ instance Checkable ImpFunction where
   checkValid f@(ImpFunction (_:> IFunType cc _ _) bs block) = addContext ctx $ do
     let scope = foldMap (binderAsEnv . fmap (const ())) bs
     let env   = foldMap (binderAsEnv                  ) bs
+             <> fmap (fromScalarType . fst) initTopEnv
     void $ flip runReaderT (env, deviceFromCallingConvention cc) $
       flip runStateT scope $ checkBlock block
     where ctx = "Checking:\n" ++ pprint f
@@ -1189,15 +1203,14 @@ checkDecl decl@(ImpLet bs instr) = addContext ctx $ do
 instrTypeChecked :: ImpInstr -> ImpCheckM [IType]
 instrTypeChecked instr = case instr of
   IFor _ i size block -> do
-    checkInt size
+    checkIdxRep size
     checkBinder i
     assertEq (binderAnn i) (getIType size) $ "Mismatch between the loop iterator and upper bound type"
     [] <- withTypeEnv (i @> getIType size) $ checkBlock block
     return []
-  IWhile cond body -> do
-    [condTy] <- checkBlock cond
-    assertEq (Scalar Word8Type) condTy $ "Not a bool: " ++ pprint cond
-    [] <- checkBlock body
+  IWhile body -> do
+    [condTy] <- checkBlock body
+    assertEq (Scalar Word8Type) condTy $ "Not a bool: " ++ pprint body
     return []
   ICond predicate consequent alternative -> do
     predTy <- checkIExpr predicate
@@ -1214,23 +1227,26 @@ instrTypeChecked instr = case instr of
     mapM_ checkIExpr args
   IPrimOp op -> (:[]) <$> checkImpOp op
   ICastOp dt x -> (:[]) <$> do
-    case getIType x of
-      Scalar _ -> return ()
-      _ -> throw CompilerErr $ "Invalid cast source type: " ++ pprint dt
-    case dt of
-      Scalar _ -> return ()
-      _ -> throw CompilerErr $ "Invalid cast destination type: " ++ pprint dt
+    let st = getIType x
+    case (dt, st) of
+      (PtrType _, PtrType _) -> return ()
+      (Scalar  _, Scalar  _) -> return ()
+      (Scalar Int64Type, PtrType  _) -> return ()
+      (PtrType _,  Scalar Int64Type) -> return ()
+      _ -> throw CompilerErr $
+            "Can't cast " ++ pprint st ++ " to " ++ pprint dt
     return dt
-  Alloc a ty _ -> (:[]) <$> do
+  Alloc a ty n -> (:[]) <$> do
+    checkIdxRep n
     when (a /= Stack) assertHost
-    return $ PtrType (AllocatedPtr, a, ty)
+    return $ PtrType (a, ty)
   MemCopy dest src numel -> [] <$ do
-    PtrType (_, _, destTy) <- checkIExpr dest
-    PtrType (_, _, srcTy)  <- checkIExpr src
+    PtrType (_, destTy) <- checkIExpr dest
+    PtrType (_, srcTy)  <- checkIExpr src
     assertEq destTy srcTy "pointer type mismatch"
-    checkInt numel
+    checkIdxRep numel
   Store dest val -> [] <$ do
-    PtrType (_, addr, ty) <- checkIExpr dest
+    PtrType (addr, ty) <- checkIExpr dest
     checkAddrAccessible addr
     valTy <- checkIExpr val
     assertEq ty valTy "Type mismatch in store"
@@ -1267,6 +1283,11 @@ checkIExpr expr = case expr of
       Nothing -> throw CompilerErr $ "Lookup failed: " ++ pprint v
       Just x -> return x
 
+checkIdxRep :: IExpr -> ImpCheckM ()
+checkIdxRep expr = do
+  t <- checkIExpr expr
+  assertEq IIdxRepTy t $ "Not an index rep tye: " ++ pprint t
+
 checkInt :: IExpr -> ImpCheckM ()
 checkInt expr = do
   bt <- checkIExpr expr
@@ -1291,12 +1312,12 @@ checkImpOp op = do
       checkIntBaseType False $ BaseTy ibt
       return $ Scalar ty
     PtrLoad ref -> do
-      PtrType (_, addr, ty) <- return ref
+      PtrType (addr, ty) <- return ref
       checkAddrAccessible addr
       return ty
     PtrOffset ref _ -> do  -- TODO: check offset too
-      PtrType (_, addr, ty) <- return ref
-      return $ PtrType (DerivedPtr, addr, ty)
+      PtrType (addr, ty) <- return ref
+      return $ PtrType (addr, ty)
     _ -> error $ "Not allowed in Imp IR: " ++ pprint op
   where
     checkEq :: (Pretty a, Show a, Eq a) => a -> a -> ImpCheckM ()
@@ -1324,13 +1345,13 @@ impInstrTypes :: ImpInstr -> [IType]
 impInstrTypes instr = case instr of
   IPrimOp op      -> [impOpType op]
   ICastOp t _     -> [t]
-  Alloc a ty _    -> [PtrType (AllocatedPtr, a, ty)]
+  Alloc a ty _    -> [PtrType (a, ty)]
   Store _ _       -> []
   Free _          -> []
   IThrowError     -> []
   MemCopy _ _ _   -> []
   IFor _ _ _ _    -> []
-  IWhile _ _      -> []
+  IWhile _        -> []
   ICond _ _ _     -> []
   ILaunch _ _ _   -> []
   ISyncWorkgroup  -> []
@@ -1360,8 +1381,8 @@ impOpType pop = case pop of
   Select  _ x  _     -> getIType x
   VectorPack xs      -> Vector ty  where Scalar ty = getIType $ head xs
   VectorIndex x _    -> Scalar ty  where Vector ty = getIType x
-  PtrLoad ref        -> ty  where PtrType (_, _, ty) = getIType ref
-  PtrOffset ref _    -> PtrType (DerivedPtr, addr, ty)  where PtrType (_, addr, ty) = getIType ref
+  PtrLoad ref        -> ty  where PtrType (_, ty) = getIType ref
+  PtrOffset ref _    -> PtrType (addr, ty)  where PtrType (addr, ty) = getIType ref
   _ -> unreachable
   where unreachable = error $ "Not allowed in Imp IR: " ++ pprint pop
 

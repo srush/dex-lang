@@ -11,9 +11,9 @@
 module Type (
   getType, checkType, HasType (..), Checkable (..), litType,
   isPure, functionEffs, exprEffs, blockEffs, extendEffect, isData, checkBinOp, checkUnOp,
-  checkIntBaseType, checkFloatBaseType, withBinder, isDependent,
+  checkIntBaseType, checkFloatBaseType, withBinder, isDependent, checkExtends,
   indexSetConcreteSize, checkNoShadow, traceCheckM, traceCheck, projectLength,
-  typeReduceBlock, typeReduceAtom, typeReduceExpr) where
+  typeReduceBlock, typeReduceAtom, typeReduceExpr, oneEffect) where
 
 import Prelude hiding (pi)
 import Control.Monad
@@ -74,7 +74,7 @@ instance Checkable Module where
   checkValid m@(Module ir decls bindings) =
     addContext ("Checking module:\n" ++ pprint m) $ asCompilerErr $ do
       let env = freeVars m
-      forM_ (envNames env) $ \v -> when (not $ isGlobal $ v:>()) $
+      forM_ (envNames env) \v -> when (not $ isGlobal $ v:>()) $
         throw CompilerErr $ "Non-global free variable in module: " ++ pprint v
       addContext "Checking IR variant" $ checkModuleVariant m
       addContext "Checking body types" $ do
@@ -92,7 +92,7 @@ checkBindings env ir bs = void $ runTypeCheck (CheckWith (env <> bs, Pure)) $
   mapM_ (checkBinding ir) $ envPairs bs
 
 checkBinding :: IRVariant -> (Name, (Type, BinderInfo)) -> TypeM ()
-checkBinding ir (GlobalName v, b@(ty, info)) =
+checkBinding ir (v, b@(ty, info)) | isGlobal (v:>()) =
   addContext ("binding: " ++ pprint (v, b)) $ do
     ty |: TyKind
     when (ir >= Evaluated && not (all isGlobal (envAsVars $ freeVars b))) $
@@ -152,21 +152,21 @@ instance HasType Atom where
     ACase e alts resultTy -> checkCase e alts resultTy
     DataConRef ~def@(DataDef _ paramBs [DataConDef _ argBs]) params args -> do
       checkEq (length paramBs) (length params)
-      forM_ (zip (toList paramBs) (toList params)) $ \(b, param) ->
+      forM_ (zip (toList paramBs) (toList params)) \(b, param) ->
         param |: binderAnn b
       let argBs' = applyNaryAbs (Abs paramBs argBs) params
       checkDataConRefBindings argBs' args
       return $ RawRefTy $ TypeCon def params
     BoxedRef b ptr numel body -> do
-      PtrTy (_, _, t) <- typeCheck ptr
+      PtrTy (_, t) <- typeCheck ptr
       checkEq (binderAnn b) (BaseTy t)
       numel |: IdxRepTy
       void $ typeCheck b
       withBinder b $ typeCheck body
     ProjectElt (i NE.:| is) v -> do
       ty <- typeCheck $ case NE.nonEmpty is of
-            Nothing -> Var v
-            Just is' -> ProjectElt is' v
+              Nothing -> Var v
+              Just is' -> ProjectElt is' v
       case ty of
         TypeCon def params -> do
           [DataConDef _ bs'] <- return $ applyDataDefParams def params
@@ -184,7 +184,8 @@ instance HasType Atom where
         PairTy x _ | i == 0 -> return x
         PairTy _ y | i == 1 -> return y
         Var _ -> throw CompilerErr $ "Tried to project value of unreduced type " <> pprint ty
-        _ -> throw TypeErr $ "Only single-member ADTs and record types can be projected. Got " <> pprint ty
+        _ -> throw TypeErr $
+              "Only single-member ADTs and record types can be projected. Got " <> pprint ty <> "   " <> pprint v
 
 
 checkDataConRefBindings :: Nest Binder -> Nest DataConRefBinding -> TypeM ()
@@ -202,7 +203,7 @@ typeCheckVar v@(name:>annTy) = do
   annTy |: TyKind
   when (annTy == EffKind) $
     throw CompilerErr "Effect variables should only occur in effect rows"
-  checkWithEnv $ \(env, _) -> case envLookup env v of
+  checkWithEnv \(env, _) -> case envLookup env v of
     Nothing -> throw CompilerErr $ "Lookup failed: " ++ pprint v
     Just (ty, _) -> assertEq annTy ty $ "Annotation on var: " ++ pprint name
   return annTy
@@ -226,19 +227,19 @@ instance HasType Expr where
 
 checkCase :: HasType b => Atom -> [AltP b] -> Type -> TypeM Type
 checkCase e alts resultTy = do
-  checkWithEnv $ \_ -> do
+  checkWithEnv \_ -> do
     ety <- typeCheck e
     case ety of
       TypeCon def params -> do
         let cons = applyDataDefParams def params
         checkEq  (length cons) (length alts)
-        forM_ (zip cons alts) $ \((DataConDef _ bs'), (Abs bs body)) -> do
+        forM_ (zip cons alts) \((DataConDef _ bs'), (Abs bs body)) -> do
           checkEq bs' bs
           resultTy' <- flip (foldr withBinder) bs $ typeCheck body
           checkEq resultTy resultTy'
       VariantTy (NoExt types) -> do
         checkEq (length types) (length alts)
-        forM_ (zip (toList types) alts) $ \(ty, (Abs bs body)) -> do
+        forM_ (zip (toList types) alts) \(ty, (Abs bs body)) -> do
           [b] <- pure $ toList bs
           checkEq (getType b) ty
           resultTy' <- flip (foldr withBinder) bs $ typeCheck body
@@ -257,7 +258,7 @@ checkApp fTy x = do
   return resultTy
 
 -- TODO: replace with something more precise (this is too cautious)
-blockEffs :: Block -> EffectSummary
+blockEffs :: Block -> EffectRow
 blockEffs (Block decls result) =
   foldMap declEffs decls <> exprEffs result
   where declEffs (Let _ _ expr) = exprEffs expr
@@ -265,37 +266,46 @@ blockEffs (Block decls result) =
 isPure :: Expr -> Bool
 isPure expr = exprEffs expr == mempty
 
-exprEffs :: Expr -> EffectSummary
+exprEffs :: Expr -> EffectRow
 exprEffs expr = case expr of
-  Atom _  -> NoEffects
+  Atom _  -> Pure
   App f _ -> functionEffs f
   Op op   -> case op of
     PrimEffect ref m -> case m of
-      MGet    -> S.singleton (State,  h)
-      MPut  _ -> S.singleton (State,  h)
-      MAsk    -> S.singleton (Reader, h)
-      MTell _ -> S.singleton (Writer, h)
+      MGet    -> oneEffect (RWSEffect State  h)
+      MPut  _ -> oneEffect (RWSEffect State  h)
+      MAsk    -> oneEffect (RWSEffect Reader h)
+      MTell _ -> oneEffect (RWSEffect Writer h)
       where RefTy (Var (h:>_)) _ = getType ref
-    _ -> NoEffects
+    ThrowException _ -> oneEffect ExceptionEffect
+    IOAlloc  _ _  -> oneEffect IOEffect
+    IOFree   _    -> oneEffect IOEffect
+    PtrLoad  _    -> oneEffect IOEffect
+    PtrStore _ _  -> oneEffect IOEffect
+    FFICall _ _ _ -> oneEffect IOEffect
+    _ -> Pure
   Hof hof -> case hof of
     For _ f         -> functionEffs f
     Tile _ _ _      -> error "not implemented"
-    While cond body -> functionEffs cond <> functionEffs body
+    While body      -> functionEffs body
     Linearize _     -> mempty  -- Body has to be a pure function
     Transpose _     -> mempty  -- Body has to be a pure function
-    RunReader _ f   -> handleRunner Reader f
-    RunWriter   f   -> handleRunner Writer f
-    RunState  _ f   -> handleRunner State  f
+    RunReader _ f   -> handleRWSRunner Reader f
+    RunWriter   f   -> handleRWSRunner Writer f
+    RunState  _ f   -> handleRWSRunner State  f
     PTileReduce _ _ -> mempty
+    RunIO ~(Lam (Abs _ (PlainArrow (EffectRow effs t), _))) ->
+      EffectRow (S.delete IOEffect effs) t
+    CatchException ~(Lam (Abs _ (PlainArrow (EffectRow effs t), _))) ->
+      EffectRow (S.delete ExceptionEffect effs) t
   Case _ alts _ -> foldMap (\(Abs _ block) -> blockEffs block) alts
   where
-    handleRunner effName ~(BinaryFunVal (Bind (h:>_)) _ (EffectRow effs Nothing) _) =
-      S.delete (effName, h) $ S.fromList effs
+    handleRWSRunner rws ~(BinaryFunVal (Bind (h:>_)) _ (EffectRow effs t) _) =
+      EffectRow (S.delete (RWSEffect rws h) effs) t
 
-functionEffs :: Atom -> EffectSummary
+functionEffs :: Atom -> EffectRow
 functionEffs f = case getType f of
-  Pi (Abs _ (arr, _)) -> S.fromList effs
-    where EffectRow effs Nothing = arrowEff arr
+  Pi (Abs _ (arr, _)) -> arrowEff arr
   _ -> error "Expected a function type"
 
 instance HasType Block where
@@ -311,7 +321,7 @@ instance HasType Block where
 
 instance HasType Binder where
   typeCheck b = do
-    checkWithEnv $ \(env, _) -> checkNoShadow env b
+    checkWithEnv \(env, _) -> checkNoShadow env b
     let ty = binderType b
     ty |: TyKind
     return ty
@@ -336,7 +346,7 @@ infixr 7 |:
   checkEq reqTy ty
 
 checkEq :: (Show a, Pretty a, Eq a) => a -> a -> TypeM ()
-checkEq reqTy ty = checkWithEnv $ \_ -> assertEq reqTy ty ""
+checkEq reqTy ty = checkWithEnv \_ -> assertEq reqTy ty ""
 
 withBinder :: Binder -> TypeM a -> TypeM a
 withBinder b m = typeCheck b >> extendTypeEnv (boundVars b) m
@@ -399,7 +409,7 @@ instance CoreVariant Expr where
     Hof e   -> checkVariant e >> forM_ e checkVariant
     Case e alts _ -> do
       checkVariant e
-      forM_ alts $ \(Abs _ body) -> checkVariant body
+      forM_ alts \(Abs _ body) -> checkVariant body
 
 instance CoreVariant Decl where
   -- let annotation restrictions?
@@ -421,6 +431,7 @@ instance CoreVariant (PrimTC a) where
 
 instance CoreVariant (PrimOp a) where
   checkVariant e = case e of
+    ThrowException _ -> goneBy Simp
     Select _ _ _       -> alwaysAllowed  -- TODO: only scalar select after Simp
     _ -> alwaysAllowed
 
@@ -432,14 +443,16 @@ instance CoreVariant (PrimCon a) where
 instance CoreVariant (PrimHof a) where
   checkVariant e = case e of
     For _ _       -> alwaysAllowed
-    While _ _     -> alwaysAllowed
+    While _       -> alwaysAllowed
     RunReader _ _ -> alwaysAllowed
     RunWriter _   -> alwaysAllowed
     RunState  _ _ -> alwaysAllowed
+    RunIO     _   -> alwaysAllowed
     Linearize _   -> goneBy Simp
     Transpose _   -> goneBy Simp
     Tile _ _ _    -> alwaysAllowed
     PTileReduce _ _ -> absentUntil Simp -- really absent until parallelization
+    CatchException _ -> goneBy Simp
 
 -- TODO: namespace restrictions?
 alwaysAllowed :: VariantM ()
@@ -459,7 +472,7 @@ goneBy ir = do
   when (curIR >= ir) $ throw IRVariantErr $ "shouldn't appear after " ++ show ir
 
 addExpr :: (Pretty e, MonadError Err m) => e -> m a -> m a
-addExpr x m = modifyErr m $ \e -> case e of
+addExpr x m = modifyErr m \e -> case e of
   Err IRVariantErr ctx s -> Err CompilerErr ctx (s ++ ": " ++ pprint x)
   _ -> e
 
@@ -467,19 +480,20 @@ addExpr x m = modifyErr m $ \e -> case e of
 
 checkEffRow :: EffectRow -> TypeM ()
 checkEffRow (EffectRow effs effTail) = do
-  forM_ effs $ \(_, v) -> Var (v:>TyKind) |: TyKind
-  forM_ effTail $ \v -> do
-    checkWithEnv $ \(env, _) -> case envLookup env (v:>()) of
+  forM_ effs \eff -> case eff of
+    RWSEffect _ v -> Var (v:>TyKind) |: TyKind
+    ExceptionEffect -> return ()
+    IOEffect        -> return ()
+  forM_ effTail \v -> do
+    checkWithEnv \(env, _) -> case envLookup env (v:>()) of
       Nothing -> throw CompilerErr $ "Lookup failed: " ++ pprint v
       Just (ty, _) -> assertEq EffKind ty "Effect var"
 
-declareEff :: (EffectName, Maybe Name) -> TypeM ()
-declareEff (effName, Just h) =
-  declareEffs $ EffectRow [(effName, h)] Nothing
-declareEff (_, Nothing) = return ()
+declareEff :: Effect -> TypeM ()
+declareEff eff = declareEffs $ oneEffect eff
 
 declareEffs :: EffectRow -> TypeM ()
-declareEffs effs = checkWithEnv $ \(_, allowedEffects) ->
+declareEffs effs = checkWithEnv \(_, allowedEffects) ->
   checkExtends allowedEffects effs
 
 checkExtends :: MonadError Err m => EffectRow -> EffectRow -> m ()
@@ -488,20 +502,23 @@ checkExtends allowed (EffectRow effs effTail) = do
   case effTail of
     Just _ -> assertEq allowedEffTail effTail ""
     Nothing -> return ()
-  forM_ effs $ \eff -> unless (eff `elem` allowedEffs) $
+  forM_ effs \eff -> unless (eff `elem` allowedEffs) $
     throw CompilerErr $ "Unexpected effect: " ++ pprint eff ++
                       "\nAllowed: " ++ pprint allowed
 
 extendEffect :: Effect -> EffectRow -> EffectRow
-extendEffect eff (EffectRow effs t) = EffectRow (eff:effs) t
+extendEffect eff (EffectRow effs t) = EffectRow (S.insert eff effs) t
+
+oneEffect :: Effect -> EffectRow
+oneEffect eff = EffectRow (S.singleton eff) Nothing
 
 -- === labeled row types ===
 
 checkLabeledRow :: ExtLabeledItems Type Name -> TypeM ()
 checkLabeledRow (Ext items rest) = do
   mapM_ (|: TyKind) items
-  forM_ rest $ \v -> do
-    checkWithEnv $ \(env, _) -> case envLookup env (v:>()) of
+  forM_ rest \v -> do
+    checkWithEnv \(env, _) -> case envLookup env (v:>()) of
       Nothing -> throw CompilerErr $ "Lookup failed: " ++ pprint v
       Just (ty, _) -> assertEq LabeledRowKind ty "Labeled row var"
 
@@ -511,7 +528,7 @@ labeledRowDifference :: ExtLabeledItems Type Name
 labeledRowDifference (Ext (LabeledItems items) rest)
                      (Ext (LabeledItems subitems) subrest) = do
   -- Check types in the right.
-  _ <- flip M.traverseWithKey subitems $ \label subtypes ->
+  _ <- flip M.traverseWithKey subitems \label subtypes ->
     case M.lookup label items of
       Just types -> assertEq subtypes
           (NE.fromList $ NE.take (length subtypes) types) $
@@ -539,7 +556,7 @@ checkWithEnv check = do
     CheckWith env -> check env
 
 updateTypeEnv :: (TypeEnv -> TypeEnv) -> TypeM a -> TypeM a
-updateTypeEnv f m = flip local m $ fmap $ \(env, eff) -> (f env, eff)
+updateTypeEnv f m = flip local m $ fmap \(env, eff) -> (f env, eff)
 
 extendTypeEnv :: TypeEnv -> TypeM a -> TypeM a
 extendTypeEnv new m = updateTypeEnv (<> new) m
@@ -551,7 +568,7 @@ extendAllowedEffect :: Effect -> TypeM () -> TypeM ()
 extendAllowedEffect eff m = updateAllowedEff (extendEffect eff) m
 
 updateAllowedEff :: (EffectRow -> EffectRow) -> TypeM a -> TypeM a
-updateAllowedEff f m = flip local m $ fmap $ \(env, eff) -> (env, f eff)
+updateAllowedEff f m = flip local m $ fmap \(env, eff) -> (env, f eff)
 
 withAllowedEff :: EffectRow -> TypeM a -> TypeM a
 withAllowedEff eff m = updateAllowedEff (const eff) m
@@ -583,7 +600,7 @@ typeCheckCon con = case con of
   IndexRangeVal t l h i -> i|:IdxRepTy >> return (TC $ IndexRange t l h)
   IndexSliceVal _ _ _ -> error "not implemented"
   BaseTypeRef p -> do
-    (PtrTy (_, _, b)) <- typeCheck p
+    (PtrTy (_, b)) <- typeCheck p
     return $ RawRefTy $ BaseTy b
   TabRef tabTy -> do
     TabTy b (RawRefTy a) <- typeCheck tabTy
@@ -636,7 +653,11 @@ checkFloatBaseType allowVector t = case t of
                                "floating-point type, but found: " ++ pprint t
 
 checkValidCast :: Type -> Type -> TypeM ()
-checkValidCast sourceTy destTy = checkScalarType sourceTy >> checkScalarType destTy
+checkValidCast (BaseTy (PtrType _)) (BaseTy (PtrType _)) = return ()
+checkValidCast (BaseTy (PtrType _)) (BaseTy (Scalar Int64Type)) = return ()
+checkValidCast (BaseTy (Scalar Int64Type)) (BaseTy (PtrType _)) = return ()
+checkValidCast sourceTy destTy =
+  checkScalarType sourceTy >> checkScalarType destTy
   where
     checkScalarType ty = case ty of
       BaseTy (Scalar Int64Type  ) -> return ()
@@ -666,12 +687,13 @@ typeCheckOp op = case op of
   ToOrdinal i -> typeCheck i $> IdxRepTy
   IdxSetSize i -> typeCheck i $> IdxRepTy
   FFICall _ ansTy args -> do
-    forM_ args $ \arg -> do
+    forM_ args \arg -> do
       argTy <- typeCheck arg
       case argTy of
         BaseTy _ -> return ()
         _        -> throw TypeErr $ "All arguments of FFI calls have to be " ++
                                     "fixed-width base types, but got: " ++ pprint argTy
+    declareEff IOEffect
     return ansTy
   Inject i -> do
     TC tc <- typeCheck i
@@ -680,15 +702,12 @@ typeCheckOp op = case op of
       ParIndexRange ty _ _ -> return ty
       _ -> throw TypeErr $ "Unsupported inject argument type: " ++ pprint (TC tc)
   PrimEffect ref m -> do
-    TC (RefType h s) <- typeCheck ref
-    let h'' = case h of
-               Just ~(Var (h':>TyKind)) -> Just h'
-               Nothing -> Nothing
+    TC (RefType ~(Just (Var (h':>TyKind))) s) <- typeCheck ref
     case m of
-      MGet    ->         declareEff (State , h'') $> s
-      MPut  x -> x|:s >> declareEff (State , h'') $> UnitTy
-      MAsk    ->         declareEff (Reader, h'') $> s
-      MTell x -> x|:s >> declareEff (Writer, h'') $> UnitTy
+      MGet    ->         declareEff (RWSEffect State  h') $> s
+      MPut  x -> x|:s >> declareEff (RWSEffect State  h') $> UnitTy
+      MAsk    ->         declareEff (RWSEffect Reader h') $> s
+      MTell x -> x|:s >> declareEff (RWSEffect Writer h') $> UnitTy
   IndexRef ref i -> do
     RefTy h (TabTyAbs a) <- typeCheck ref
     i |: absArgType a
@@ -699,17 +718,27 @@ typeCheckOp op = case op of
   SndRef ref -> do
     RefTy h (PairTy _ b) <- typeCheck ref
     return $ RefTy h b
+  IOAlloc t n -> do
+    n |: IdxRepTy
+    declareEff IOEffect
+    return $ PtrTy (Heap CPU, t)
+  IOFree ptr -> do
+    PtrTy _ <- typeCheck ptr
+    declareEff IOEffect
+    return UnitTy
   PtrOffset arr off -> do
-    PtrTy (_, a, b) <- typeCheck arr
+    PtrTy (a, b) <- typeCheck arr
     off |: IdxRepTy
-    return $ PtrTy (DerivedPtr, a, b)
+    return $ PtrTy (a, b)
   PtrLoad ptr -> do
-    PtrTy (_, _, t)  <- typeCheck ptr
+    PtrTy (_, t) <- typeCheck ptr
+    declareEff IOEffect
     return $ BaseTy t
-  GetPtr tab -> do
-    TabTy _ (BaseTy a) <- typeCheck tab
-    return $ BaseTy $ PtrType (AllocatedPtr, Heap CPU, a)
-  MakePtrType ty -> ty|:TyKind >> return TyKind
+  PtrStore ptr val -> do
+    PtrTy (_, t)  <- typeCheck ptr
+    val |: BaseTy t
+    declareEff IOEffect
+    return $ UnitTy
   SliceOffset s i -> do
     TC (IndexSlice n l) <- typeCheck s
     l' <- typeCheck i
@@ -733,7 +762,9 @@ typeCheckOp op = case op of
     i |: TC (IntRange (IdxRepVal 0) (IdxRepVal $ fromIntegral vectorWidth))
     return $ BaseTy $ Scalar sb
   ThrowError ty -> ty|:TyKind $> ty
-  -- TODO: this should really be a 32 bit integer for unicode code point: but for now is 8 bit ASCII code point
+  ThrowException ty -> do
+    declareEff ExceptionEffect
+    ty|:TyKind $> ty
   CastOp t@(Var _) _ -> t |: TyKind $> t
   CastOp destTy e -> do
     sourceTy <- typeCheck e
@@ -784,7 +815,7 @@ typeCheckOp op = case op of
     t |: TyKind
     x |: Word8Ty
     (TypeCon (DataDef _ _ dataConDefs) _) <- return t
-    forM_ dataConDefs $ \(DataConDef _ binders) ->
+    forM_ dataConDefs \(DataConDef _ binders) ->
       assertEq binders Empty "Not an enum"
     return t
 
@@ -833,13 +864,10 @@ typeCheckHof hof = case hof of
     checkEq threadRange (binderType threadRange')
     -- PTileReduce n mapping : (n=>a, ro)
     return $ PairTy (TabTy (Ignore n) tileElemTy) accTy
-  While cond body -> do
-    Pi (Abs (Ignore UnitTy) (arr , condTy)) <- typeCheck cond
-    Pi (Abs (Ignore UnitTy) (arr', bodyTy)) <- typeCheck body
+  While body -> do
+    Pi (Abs (Ignore UnitTy) (arr , condTy)) <- typeCheck body
     declareEffs $ arrowEff arr
-    declareEffs $ arrowEff arr'
     checkEq (BaseTy $ Scalar Word8Type) condTy
-    checkEq UnitTy bodyTy
     return UnitTy
   Linearize f -> do
     Pi (Abs (Ignore a) (PlainArrow Pure, b)) <- typeCheck f
@@ -848,21 +876,31 @@ typeCheckHof hof = case hof of
     Pi (Abs (Ignore a) (LinArrow, b)) <- typeCheck f
     return $ b --@ a
   RunReader r f -> do
-    (resultTy, readTy) <- checkAction Reader f
+    (resultTy, readTy) <- checkRWSAction Reader f
     r |: readTy
     return resultTy
-  RunWriter f -> uncurry PairTy <$> checkAction Writer f
+  RunWriter f -> uncurry PairTy <$> checkRWSAction Writer f
   RunState s f -> do
-    (resultTy, stateTy) <- checkAction State f
+    (resultTy, stateTy) <- checkRWSAction State f
     s |: stateTy
     return $ PairTy resultTy stateTy
+  RunIO f -> do
+    FunTy b eff resultTy <- typeCheck f
+    checkEq (binderAnn b) UnitTy
+    extendAllowedEffect IOEffect $ declareEffs eff
+    return resultTy
+  CatchException f -> do
+    FunTy b eff resultTy <- typeCheck f
+    checkEq (binderAnn b) UnitTy
+    extendAllowedEffect ExceptionEffect $ declareEffs eff
+    return $ MaybeTy resultTy
 
-checkAction :: EffectName -> Atom -> TypeM (Type, Type)
-checkAction effName f = do
+checkRWSAction :: RWS -> Atom -> TypeM (Type, Type)
+checkRWSAction rws f = do
   BinaryFunTy (Bind regionBinder) refBinder eff resultTy <- typeCheck f
   regionName:>_ <- return regionBinder
   let region = Var regionBinder
-  extendAllowedEffect (effName, regionName) $ declareEffs eff
+  extendAllowedEffect (RWSEffect rws regionName) $ declareEffs eff
   checkEq (varAnn regionBinder) TyKind
   RefTy region' referentTy <- return $ binderAnn refBinder
   checkEq region' region
@@ -1041,10 +1079,5 @@ typeReduceExpr scope expr = case expr of
       Lam (Abs b (arr, block)) | arr == PureArrow || arr == ImplicitArrow ->
         typeReduceBlock scope $ subst (b@>x', scope) block
       TypeCon con xs -> Just $ TypeCon con $ xs ++ [x']
-      _ -> Nothing
-  Op (MakePtrType ty) -> do
-    let ty' = typeReduceAtom scope ty
-    case ty' of
-      BaseTy b -> return $ PtrTy (AllocatedPtr, Heap CPU, b)
       _ -> Nothing
   _ -> Nothing

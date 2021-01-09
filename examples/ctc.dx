@@ -48,8 +48,11 @@ def logaddexp (x:Float) (y:Float) : Float =
   m = max x y
   m + ( log ( (exp (x - m) + exp (y - m))))
 
-def ctc (dict: Eq vocab) ?=> (dict2: Eq position) ?=> (dict3: Eq time) ?=> (blank: vocab)
-        (logits: time=>vocab=>Float) (labels: position=>vocab) : Float =
+def ctc [Eq vocab, Eq position, Eq time]
+        (blank:  vocab)
+        (logits: time=>vocab=>Float)
+        (labels: position=>vocab)
+        : Float =
   -- Computes log p(labels | logits), marginalizing over possible alignments.
   -- Todo: remove unnecessary implicit type annotations once
   -- Dex starts putting implicit types in scope.
@@ -103,22 +106,22 @@ def randIdxNoZero (n:Type) -> (k:Key) : n =
   unif = rand k
   fromOrdinal n $ (1 + (FToI (floor ( unif * IToF ((size n) - 1)))))
 
-vocab = Fin 6
+Vocab = Fin 6
 position = Fin 3
-blank = 0@vocab
+blank = 0@Vocab
 
 -- Create random logits
-time = Fin 4
-logits = for i:time j:vocab. (randn $ ixkey2 (newKey 0) i j)
+Time = Fin 4
+logits : Time => Vocab => Float = arb $ newKey 0
 
 -- Create random labels
-labels = for i:position. randIdxNoZero vocab (newKey (ordinal i))
+labels = for i:position. randIdxNoZero Vocab (newKey (ordinal i))
 :p labels
 > [(1@Fin 6), (5@Fin 6), (5@Fin 6)]
 
 -- Evaluate marginal probability of labels given logits
 :p exp $ ctc blank logits labels
-> 1.0398488e-3
+> 0.00104
 
 
 
@@ -130,14 +133,14 @@ labels = for i:position. randIdxNoZero vocab (newKey (ordinal i))
 -- e.g. the summed-over labels should include blanks.
 
 
-:p sum for i:vocab.
+:p sum for i:Vocab.
   exp $ ctc blank logits [i]
-> 0.14146839
+> 0.141468
 
-:p sum for (i, j):(vocab & vocab).
+:p sum for (i, j):(Vocab & Vocab).
   exp $ ctc blank logits [i, j]
-> 0.7091234
+> 0.709123
 
-:p sum for (i, j, k):(vocab & vocab & vocab).
+:p sum for (i, j, k):(Vocab & Vocab & Vocab).
   exp $ ctc blank logits [i, j, k]
-> 0.9251011
+> 0.925101

@@ -9,7 +9,6 @@
 module Simplify (simplifyModule, simplifyCase, splitSimpModule) where
 
 import Control.Monad
-import Control.Monad.Identity
 import Control.Monad.Reader
 import Data.Maybe
 import Data.Foldable (toList)
@@ -17,6 +16,7 @@ import Data.Functor
 import Data.List (partition, elemIndex)
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 
 import Autodiff
 import Env
@@ -27,7 +27,7 @@ import Type
 import PPrint
 import Util
 
-type SimplifyM = SubstEmbedT Identity
+type SimplifyM = SubstEmbed
 
 simplifyModule :: TopEnv -> Module -> Module
 simplifyModule scope (Module Core decls bindings) = do
@@ -61,7 +61,7 @@ hoistDepDataCons scope (Module Simp decls bindings) =
   where
     (bindings', (_, decls')) = flip runEmbed scope $ do
       mapM_ emitDecl decls
-      forM bindings $ \(ty, info) -> case info of
+      forM bindings \(ty, info) -> case info of
         LetBound ann x | isData ty -> do x' <- emit x
                                          return (ty, LetBound ann $ Atom x')
         _ -> return (ty, info)
@@ -89,7 +89,7 @@ simplifyDecl (Let ann b expr) = do
 simplifyStandalone :: Expr -> SimplifyM Atom
 simplifyStandalone (Atom (LamVal b body)) = do
   b' <- mapM substEmbedR b
-  buildLam b' PureArrow $ \x ->
+  buildLam b' PureArrow \x ->
     extendR (b@>x) $ simplifyBlock body
 simplifyStandalone block =
   error $ "@noinline decorator applied to non-function" ++ pprint block
@@ -139,9 +139,9 @@ simplifyAtom atom = case atom of
     case simplifyCase e' alts of
       Just (env, result) -> extendR env $ simplifyAtom result
       Nothing -> do
-        alts' <- forM alts $ \(Abs bs a) -> do
+        alts' <- forM alts \(Abs bs a) -> do
           bs' <- mapM (mapM substEmbedR) bs
-          (Abs bs'' b) <- buildNAbs bs' $ \xs -> extendR (newEnv bs' xs) $ simplifyAtom a
+          (Abs bs'' b) <- buildNAbs bs' \xs -> extendR (newEnv bs' xs) $ simplifyAtom a
           case b of
             Block Empty (Atom r) -> return $ Abs bs'' r
             _                    -> error $ "Nontrivial block in ACase simplification"
@@ -192,7 +192,7 @@ simplifyLams numArgs lam = do
         Left  res -> (res, Nothing)
         Right (dat, (ctx, recon), atomf) ->
           ( mkConsList $ (toList dat) ++ (toList ctx)
-          , Just $ \vals -> do
+          , Just \vals -> do
              (datEls', ctxEls') <- splitAt (length dat) <$> unpackConsList vals
              let dat' = restructure datEls' dat
              let ctx' = restructure ctxEls' ctx
@@ -200,7 +200,7 @@ simplifyLams numArgs lam = do
           )
     go n scope ~(Block Empty (Atom (Lam (Abs b (arr, body))))) = do
       b' <- mapM substEmbedR b
-      buildLamAux b' (\x -> extendR (b@>x) $ substEmbedR arr) $ \x@(Var v) -> do
+      buildLamAux b' (\x -> extendR (b@>x) $ substEmbedR arr) \x@(Var v) -> do
         let scope' = scope <> v @> (varType v, LamBound (void arr))
         extendR (b@>x) $ go (n-1) scope' body
 
@@ -278,7 +278,7 @@ separateDataComponent localVars v = do
           True  -> nubCtx t
           False -> h : (nubCtx t)
         result = nubCtx $ toList ll
-        inv ctx' result' = for ll $ \x -> case elemIndex x (toList ctx) of
+        inv ctx' result' = for ll \x -> case elemIndex x (toList ctx) of
           Just i  -> (toList ctx') !! i
           Nothing -> result' !! (fromJust $ elemIndex x result)
 
@@ -299,7 +299,7 @@ simplifyExpr expr = case expr of
         case all isCurriedFun alts of
           True -> return $ ACase e (fmap appAlt alts) rty'
           False -> do
-            let alts' = for alts $ \(Abs bs a) -> Abs bs $ Block Empty (App a x')
+            let alts' = for alts \(Abs bs a) -> Abs bs $ Block Empty (App a x')
             dropSub $ simplifyExpr $ Case e alts' rty'
         where
           isCurriedFun alt = case alt of
@@ -321,16 +321,16 @@ simplifyExpr expr = case expr of
       Nothing -> do
         if isData resultTy'
           then do
-            alts' <- forM alts $ \(Abs bs body) -> do
+            alts' <- forM alts \(Abs bs body) -> do
               bs' <-  mapM (mapM substEmbedR) bs
-              buildNAbs bs' $ \xs -> extendR (newEnv bs' xs) $ simplifyBlock body
+              buildNAbs bs' \xs -> extendR (newEnv bs' xs) $ simplifyBlock body
             emit $ Case e' alts' resultTy'
           else do
             -- Construct the blocks of new cases. The results will only get replaced
             -- later, once we learn the closures of the non-data component of each case.
-            (alts', facs) <- liftM unzip $ forM alts $ \(Abs bs body) -> do
+            (alts', facs) <- liftM unzip $ forM alts \(Abs bs body) -> do
               bs' <-  mapM (mapM substEmbedR) bs
-              buildNAbsAux bs' $ \xs -> do
+              buildNAbsAux bs' \xs -> do
                 ~(Right fac@(dat, (ctx, _), _)) <- extendR (newEnv bs' xs) $ defunBlock (boundVars bs') body
                 -- NB: The return value here doesn't really matter as we're going to replace it afterwards.
                 return (mkConsList $ toList dat ++ toList ctx, fac)
@@ -361,9 +361,9 @@ simplifyExpr expr = case expr of
             --       a single output. This can probably be made quite a bit faster.
             -- NB: All the non-data trees have the same structure, so we pick an arbitrary one.
             nondatTree <- (\(_, (ctx, rec), _) -> rec dat ctx) $ head facs
-            nondat <- forM (enumerate nondatTree) $ \(i, _) -> do
-              aalts <- forM facs $ \(_, (ctx, rec), _) -> do
-                Abs bs' b <- buildNAbs (toNest $ toList $ fmap (Ignore . getType) ctx) $ \ctxVals ->
+            nondat <- forM (enumerate nondatTree) \(i, _) -> do
+              aalts <- forM facs \(_, (ctx, rec), _) -> do
+                Abs bs' b <- buildNAbs (toNest $ toList $ fmap (Ignore . getType) ctx) \ctxVals ->
                   ((!! i) . toList) <$> rec dat (restructure ctxVals ctx)
                 case b of
                   Block Empty (Atom r) -> return $ Abs bs' r
@@ -441,16 +441,15 @@ simplifyHof hof = case hof of
     ans <- emit $ Hof $ For d lam'
     case recon of
       Nothing -> return ans
-      Just f  -> buildLam i TabArrow $ \i' -> app ans i' >>= f
+      Just f  -> buildLam i TabArrow \i' -> app ans i' >>= f
   Tile d fT fS -> do
     ~(fT', Nothing) <- simplifyLam fT
     ~(fS', Nothing) <- simplifyLam fS
     emit $ Hof $ Tile d fT' fS'
   PTileReduce _ _ -> error "Unexpected PTileReduce"
-  While cond body -> do
-    ~(cond', Nothing) <- simplifyLam cond
+  While body -> do
     ~(body', Nothing) <- simplifyLam body
-    emit $ Hof $ While cond' body'
+    emit $ Hof $ While body'
   Linearize lam -> do
     ~(lam', Nothing) <- simplifyLam lam
     scope <- getScope
@@ -475,6 +474,83 @@ simplifyHof hof = case hof of
     (ans, sOut) <- fromPair =<< (emit $ Hof $ RunState s' lam')
     ans' <- applyRecon recon ans
     return $ PairVal ans' sOut
+  RunIO lam -> do
+    ~(lam', recon) <- simplifyLam lam
+    ans <- emit $ Hof $ RunIO lam'
+    applyRecon recon ans
+  CatchException lam -> do
+    ~(Lam (Abs _ (_, body)), Nothing) <- simplifyLam lam
+    dropSub $ exceptToMaybeBlock body
   where
     applyRecon Nothing x = return x
     applyRecon (Just f) x = f x
+
+exceptToMaybeBlock :: Block -> SubstEmbed Atom
+exceptToMaybeBlock (Block Empty result) = exceptToMaybeExpr result
+exceptToMaybeBlock (Block (Nest (Let _ b expr) decls) result) = do
+  a <- substEmbedR $ getType result
+  maybeResult <- exceptToMaybeExpr expr
+  case maybeResult of
+    -- These two cases are just an optimization
+    JustAtom _ x  -> extendR (b@>x) $ exceptToMaybeBlock $ Block decls result
+    NothingAtom _ -> return $ NothingAtom a
+    _ -> do
+      emitMaybeCase maybeResult (return $ NothingAtom a) \x -> do
+        extendR (b@>x) $ exceptToMaybeBlock $ Block decls result
+
+exceptToMaybeExpr :: Expr -> SubstEmbed Atom
+exceptToMaybeExpr expr = do
+  a <- substEmbedR $ getType expr
+  case expr of
+    Case e alts resultTy -> do
+      e' <- substEmbedR e
+      resultTy' <- substEmbedR $ MaybeTy resultTy
+      alts' <- forM alts \(Abs bs body) -> do
+        bs' <-  substEmbedR bs
+        buildNAbs bs' \xs -> extendR (newEnv bs' xs) $ exceptToMaybeBlock body
+      emit $ Case e' alts' resultTy'
+    Atom x -> substEmbedR $ JustAtom (getType x) x
+    Op (ThrowException _) -> return $ NothingAtom a
+    Hof (For ann ~(Lam (Abs b (_, body)))) -> do
+      b' <- substEmbedR b
+      maybes <- buildForAnn ann b' \i -> extendR (b@>i) $ exceptToMaybeBlock body
+      catMaybesE maybes
+    Hof (RunState s lam) -> do
+      s' <- substEmbedR s
+      let BinaryFunVal _ b _ body = lam
+      result  <- emitRunState "ref" s' \ref ->
+        extendR (b@>ref) $ exceptToMaybeBlock body
+      (maybeAns, newState) <- fromPair result
+      emitMaybeCase maybeAns (return $ NothingAtom a) \ans ->
+        return $ JustAtom a $ PairVal ans newState
+    Hof (While ~(Lam (Abs _ (_, body)))) -> do
+      eff <- getAllowedEffects
+      lam <- buildLam (Ignore UnitTy) (PlainArrow eff) \_ ->
+               exceptToMaybeBlock body
+      runMaybeWhile lam
+    _ | not (hasExceptions expr) -> do
+          x <- substEmbedR expr >>= emit
+          return $ JustAtom (getType x) x
+      | otherwise ->
+          error $ "Unexpected exception-throwing expression: " ++ pprint expr
+
+hasExceptions :: Expr -> Bool
+hasExceptions expr = case t of
+  Nothing -> ExceptionEffect `S.member` effs
+  Just _  -> error "Shouldn't have tail left"
+  where (EffectRow effs t) = exprEffs expr
+
+catMaybesE :: MonadEmbed m => Atom -> m Atom
+catMaybesE maybes = simplifyEmbed $ do
+  let (TabTy b (MaybeTy a)) = getType maybes
+  applyPreludeFunction "seqMaybes" [binderAnn b, a, maybes]
+
+runMaybeWhile :: MonadEmbed m => Atom -> m Atom
+runMaybeWhile lam = simplifyEmbed $ do
+  let (Pi (Abs _ (PlainArrow eff, _))) = getType lam
+  applyPreludeFunction "whileMaybe" [Eff eff, lam]
+
+simplifyEmbed :: MonadEmbed m => m Atom -> m Atom
+simplifyEmbed m = do
+  block <- buildScoped m
+  liftEmbed $ runReaderT (simplifyBlock block) mempty

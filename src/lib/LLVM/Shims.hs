@@ -7,7 +7,6 @@
 module LLVM.Shims (
   SymbolResolver (..), newSymbolResolver, disposeSymbolResolver,
   newTargetMachine, newHostTargetMachine, disposeTargetMachine,
-  newTargetOptions, disposeTargetOptions
   ) where
 
 import qualified Data.Map as M
@@ -36,7 +35,7 @@ data SymbolResolver = SymbolResolver (FunPtr FFIResolver) (Ptr OrcJIT.FFI.Symbol
 -- | Create a `FFI.SymbolResolver` that can be used with the JIT.
 newSymbolResolver :: OrcJIT.ExecutionSession -> OrcJIT.SymbolResolver -> IO SymbolResolver
 newSymbolResolver (OrcJIT.ExecutionSession session) (OrcJIT.SymbolResolver resolverFn) = do
-  ffiResolverPtr <- wrapFFIResolver $ \sym res -> do
+  ffiResolverPtr <- wrapFFIResolver \sym res -> do
     f <- encodeM =<< resolverFn =<< decodeM sym
     f res
   lambdaResolver <- OrcJIT.FFI.createLambdaResolver session ffiResolverPtr
@@ -61,10 +60,10 @@ newTargetMachine :: Target.Target
 newTargetMachine (Target.Target targetFFI) triple cpu features
                  (Target.TargetOptions targetOptFFI)
                  relocModel codeModel cgoLevel = do
-  SBS.useAsCString triple $ \tripleFFI -> do
-    BS.useAsCString cpu $ \cpuFFI -> do
+  SBS.useAsCString triple \tripleFFI -> do
+    BS.useAsCString cpu \cpuFFI -> do
       let featuresStr = BS.intercalate "," $ fmap encodeFeature $ M.toList features
-      BS.useAsCString featuresStr $ \featuresFFI -> do
+      BS.useAsCString featuresStr \featuresFFI -> do
         relocModelFFI <- encodeM relocModel
         codeModelFFI <- encodeM codeModel
         cgoLevelFFI <- encodeM cgoLevel
@@ -73,24 +72,15 @@ newTargetMachine (Target.Target targetFFI) triple cpu features
                 targetOptFFI relocModelFFI codeModelFFI cgoLevelFFI
   where encodeFeature (Target.CPUFeature f, on) = (if on then "+" else "-") <> f
 
-newHostTargetMachine :: R.Model -> CM.Model -> CGO.Level -> IO (Target.TargetMachine, Target.TargetOptions)
+newHostTargetMachine :: R.Model -> CM.Model -> CGO.Level -> IO Target.TargetMachine
 newHostTargetMachine relocModel codeModel cgoLevel = do
   Target.initializeAllTargets
   triple <- Target.getProcessTargetTriple
   (target, _) <- Target.lookupTarget Nothing triple
   cpu <- Target.getHostCPUName
   features <- Target.getHostCPUFeatures
-  targetOptions <- newTargetOptions
-  tm <- newTargetMachine target triple cpu features targetOptions relocModel codeModel cgoLevel
-  return (tm, targetOptions)
+  Target.withTargetOptions \targetOptions ->
+    newTargetMachine target triple cpu features targetOptions relocModel codeModel cgoLevel
 
 disposeTargetMachine :: Target.TargetMachine -> IO ()
 disposeTargetMachine (Target.TargetMachine tmFFI) = Target.FFI.disposeTargetMachine tmFFI
-
--- llvm-hs doesn't expose any way to manage target options in a non-bracketed way
-
-newTargetOptions :: IO Target.TargetOptions
-newTargetOptions = Target.TargetOptions <$> Target.FFI.createTargetOptions
-
-disposeTargetOptions :: Target.TargetOptions -> IO ()
-disposeTargetOptions (Target.TargetOptions optsFFI) = Target.FFI.disposeTargetOptions optsFFI
